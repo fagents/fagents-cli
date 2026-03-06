@@ -243,6 +243,42 @@ assert_json "$OUT" '.flags | length == 2' "help lists flags"
 
 echo ""
 
+# ── allowed users gate ──
+
+echo "allowed users gate:"
+
+# Set up updates with from.id=42
+set_mock getUpdates '{"ok":true,"result":[{"update_id":400,"message":{"message_id":4,"chat":{"id":789,"type":"private"},"from":{"id":42,"is_bot":false,"first_name":"Trusted","username":"trusted"},"text":"allowed msg","date":1709600004}},{"update_id":401,"message":{"message_id":5,"chat":{"id":790,"type":"private"},"from":{"id":99,"is_bot":false,"first_name":"Stranger","username":"stranger"},"text":"blocked msg","date":1709600005}}]}'
+
+# With TELEGRAM_ALLOWED_IDS=42, only from.id=42 should pass
+OUT=$(TELEGRAM_ALLOWED_IDS="42" run poll)
+LINES=$(echo "$OUT" | wc -l | tr -d ' ')
+assert_eq "1" "$LINES" "gate passes only allowed user"
+assert_json "$OUT" '.from == "trusted"' "gate passes correct user"
+assert_json "$OUT" '.text == "allowed msg"' "gate passes correct message"
+
+# With TELEGRAM_ALLOWED_IDS=99, only from.id=99 should pass
+OUT=$(TELEGRAM_ALLOWED_IDS="99" run poll)
+assert_json "$OUT" '.from == "stranger"' "gate passes different allowed user"
+
+# With TELEGRAM_ALLOWED_IDS not set, both pass
+set_mock getUpdates '{"ok":true,"result":[{"update_id":400,"message":{"message_id":4,"chat":{"id":789,"type":"private"},"from":{"id":42,"is_bot":false,"first_name":"Trusted","username":"trusted"},"text":"allowed msg","date":1709600004}},{"update_id":401,"message":{"message_id":5,"chat":{"id":790,"type":"private"},"from":{"id":99,"is_bot":false,"first_name":"Stranger","username":"stranger"},"text":"blocked msg","date":1709600005}}]}'
+OUT=$(run poll)
+LINES=$(echo "$OUT" | wc -l | tr -d ' ')
+assert_eq "2" "$LINES" "no gate allows all messages"
+
+# With TELEGRAM_ALLOWED_IDS set to non-matching ID, nothing passes
+OUT=$(TELEGRAM_ALLOWED_IDS="999" run poll 2>/dev/null) ; RC=$?
+assert_eq "1" "$RC" "gate blocks all non-matching users (exit 1)"
+
+# Multiple allowed users (comma-separated)
+set_mock getUpdates '{"ok":true,"result":[{"update_id":400,"message":{"message_id":4,"chat":{"id":789,"type":"private"},"from":{"id":42,"is_bot":false,"first_name":"Trusted","username":"trusted"},"text":"msg1","date":1709600004}},{"update_id":401,"message":{"message_id":5,"chat":{"id":790,"type":"private"},"from":{"id":99,"is_bot":false,"first_name":"Stranger","username":"stranger"},"text":"msg2","date":1709600005}}]}'
+OUT=$(TELEGRAM_ALLOWED_IDS="42,99" run poll)
+LINES=$(echo "$OUT" | wc -l | tr -d ' ')
+assert_eq "2" "$LINES" "gate allows multiple comma-separated user IDs"
+
+echo ""
+
 # ── Results ──
 
 echo "=== Results: $PASS passed, $FAIL failed ==="

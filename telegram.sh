@@ -45,6 +45,10 @@ if [[ -z "$TOKEN" ]]; then
     OFFSET_FILE="$CREDS_DIR/$CALLER/telegram-offset"
 fi
 
+# Allowed user IDs gate: comma-separated Telegram user IDs (numeric, permanent)
+# If set, poll only outputs messages from these IDs. Others are silently consumed.
+ALLOWED="${TELEGRAM_ALLOWED_IDS:-}"
+
 # HTTP helper — calls Bot API, sets BOT_RESP on success, outputs JSON error + exits on failure
 BOT_RESP=""
 bot_api() {
@@ -120,6 +124,12 @@ case "$cmd" in
             # Filter: only message updates with text (skip edits, callbacks, etc.)
             has_text=$(echo "$update" | jq -r 'select(.message.text) | .update_id' 2>/dev/null)
             [[ -z "$has_text" ]] && continue
+
+            # Gate: skip messages from users not in TELEGRAM_ALLOWED_IDS
+            if [[ -n "$ALLOWED" ]]; then
+                from_id=$(echo "$update" | jq -r '.message.from.id' 2>/dev/null)
+                [[ ",$ALLOWED," == *",$from_id,"* ]] || continue
+            fi
 
             echo "$update" | jq -c '{
                 update_id: .update_id,
