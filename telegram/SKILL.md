@@ -1,20 +1,21 @@
 ---
 name: telegram
-description: Send and receive Telegram messages via Bot API.
-argument-hint: "[send|poll|whoami] [args...]"
-allowed-tools: Bash(sudo -u fagents */telegram.sh *)
+description: Send and receive Telegram messages (text + voice) via Bot API.
+argument-hint: "[send|sendVoice|poll|whoami] [args...]"
+allowed-tools: Bash(sudo -u fagents */telegram.sh *),Bash(sudo -u fagents */tts-speak.sh *),Bash(sudo -u fagents */stt-transcribe.sh *)
 ---
 
 # Telegram
 
-Send and receive Telegram DMs via the Bot API. Messages are 1:1 between a Telegram user and your bot.
+Send and receive Telegram DMs via the Bot API. Supports text and voice messages.
 
 ## Usage
 
-All commands go through sudo — you never see the bot token:
+All commands go through sudo — you never see the bot token or API keys:
 
 ```bash
-sudo -u fagents /home/fagents/workspace/fagents-cli/telegram.sh <command> [args...]
+CLI=/home/fagents/workspace/fagents-cli
+sudo -u fagents $CLI/telegram.sh <command> [args...]
 ```
 
 ## Commands
@@ -22,29 +23,59 @@ sudo -u fagents /home/fagents/workspace/fagents-cli/telegram.sh <command> [args.
 ### whoami
 Verify your bot token works. Returns bot info.
 ```bash
-sudo -u fagents /home/fagents/workspace/fagents-cli/telegram.sh whoami
+sudo -u fagents $CLI/telegram.sh whoami
 ```
 
 ### send
-Send a message to a chat. Chat ID comes from a previous `poll` or is known.
+Send a text message to a chat. Chat ID comes from a previous `poll` or is known.
 ```bash
-sudo -u fagents /home/fagents/workspace/fagents-cli/telegram.sh send <chat-id> "message text"
+sudo -u fagents $CLI/telegram.sh send <chat-id> "message text"
+```
+
+### sendVoice
+Send an OGG/Opus audio file as a voice message.
+```bash
+sudo -u fagents $CLI/telegram.sh sendVoice <chat-id> <voice-file.ogg>
 ```
 
 ### poll
-Check for new DMs. Returns one JSON line per message, exits 1 if no new messages.
+Check for new DMs. Returns one JSON line per message, exits 1 if no new messages. Detects both text and voice messages.
 ```bash
-sudo -u fagents /home/fagents/workspace/fagents-cli/telegram.sh poll
+sudo -u fagents $CLI/telegram.sh poll
 ```
 
-Output format:
+Text message output:
 ```json
-{"update_id":123,"chat_id":456,"from":"username","text":"hello","date":1709600000}
+{"update_id":123,"chat_id":456,"from":"username","text":"hello","date":1709600000,"type":"text"}
 ```
+
+Voice message output:
+```json
+{"update_id":124,"chat_id":456,"from":"username","text":null,"date":1709600001,"type":"voice","file_id":"AwACAgIA...","duration":3}
+```
+
+## Voice
+
+### Text to speech (reply with voice)
+Converts text to speech via OpenAI TTS and sends as a Telegram voice message:
+```bash
+sudo -u fagents $CLI/tts-speak.sh <chat-id> "text to speak"
+```
+Options: `--voice <alloy|nova|shimmer|...>`, `--model <tts-1|tts-1-hd>`
+
+### Speech to text (transcribe voice message)
+Downloads a voice message from Telegram and transcribes via OpenAI Whisper:
+```bash
+sudo -u fagents $CLI/stt-transcribe.sh <file-id>
+```
+The `file_id` comes from poll output. Options: `--model <whisper-1>`, `--language <code>`
+
+Your daemon's `collect_telegram()` handles voice transcription automatically — incoming voice messages arrive in your inbox as text.
 
 ## Notes
 
 - All output is JSON — parse with `jq`
 - Offset tracking is automatic (handled by the CLI, not you)
 - One bot per agent — `getUpdates` is destructive (consumes offsets)
-- Your daemon's `collect_telegram()` calls poll automatically — use `send` for replies
+- Your daemon's `collect_telegram()` calls poll automatically — use `send` or `tts-speak.sh` for replies
+- Do NOT try to access bot tokens or API keys directly — credential isolation via sudo
