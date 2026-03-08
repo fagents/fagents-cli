@@ -8,9 +8,10 @@
 #   Resolves caller from $SUDO_USER, loads creds from /home/fagents/.agents/<caller>/
 #
 # Commands:
-#   telegram.sh whoami                    — verify bot token (getMe)
-#   telegram.sh send <chat-id> <message>  — send message to chat
-#   telegram.sh poll                      — get new DMs (one JSON line per message)
+#   telegram.sh whoami                        — verify bot token (getMe)
+#   telegram.sh send <chat-id> <message>      — send message to chat
+#   telegram.sh sendVoice <chat-id> <file>    — send voice message (OGG/Opus)
+#   telegram.sh poll                          — get new DMs (one JSON line per message)
 
 set -euo pipefail
 
@@ -102,6 +103,15 @@ case "$cmd" in
         echo "$BOT_RESP" | jq -c '.result | {message_id, chat_id: .chat.id}'
         ;;
 
+    sendVoice|send-voice)
+        chat_id="${1:-}"
+        voice_file="${2:-}"
+        [[ -n "$chat_id" ]] && [[ -n "$voice_file" ]] || err "usage: sendVoice <chat-id> <voice-file>"
+        [[ -f "$voice_file" ]] || err "file not found: $voice_file"
+        bot_api POST sendVoice -F "chat_id=$chat_id" -F "voice=@$voice_file"
+        echo "$BOT_RESP" | jq -c '.result | {message_id, chat_id: .chat.id, duration: .voice.duration}'
+        ;;
+
     poll)
         # Read current offset
         offset=0
@@ -160,6 +170,7 @@ case "$cmd" in
             commands: {
                 whoami: "whoami — verify bot token (getMe)",
                 send: "send <chat-id> <message> — send message to chat",
+                sendVoice: "sendVoice <chat-id> <voice-file> — send voice message (OGG/Opus)",
                 poll: "poll — get new DMs (one JSON line per message)"
             },
             flags: ["--token <bot-token>", "--api-base <url>"],

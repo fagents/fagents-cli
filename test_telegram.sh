@@ -28,6 +28,9 @@ EOF
     cat > "$MOCK_DIR/sendMessage.json" <<'EOF'
 {"ok":true,"result":{"message_id":1,"chat":{"id":456,"type":"private"},"text":"hello"}}
 EOF
+    cat > "$MOCK_DIR/sendVoice.json" <<'EOF'
+{"ok":true,"result":{"message_id":2,"chat":{"id":456,"type":"private"},"voice":{"duration":5,"file_id":"abc123"}}}
+EOF
     cat > "$MOCK_DIR/getUpdates.json" <<'EOF'
 {"ok":true,"result":[{"update_id":100,"message":{"message_id":1,"chat":{"id":789,"type":"private"},"from":{"id":1,"is_bot":false,"first_name":"Tester","username":"tester"},"text":"hello","date":1709600000}}]}
 EOF
@@ -70,9 +73,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.split('?')[0]
         parts = path.strip('/').split('/')
         length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(length).decode() if length else ''
-        # Save last POST body for inspection
-        with open(os.path.join(DATA_DIR, 'last-post.json'), 'w') as f:
+        raw = self.rfile.read(length) if length else b''
+        # Save last POST body for inspection (text for JSON, binary-safe for multipart)
+        try:
+            body = raw.decode()
+        except UnicodeDecodeError:
+            body = raw.decode('latin-1')
+        with open(os.path.join(DATA_DIR, 'last-post.txt'), 'w') as f:
             f.write(body)
         if len(parts) >= 2:
             endpoint = parts[-1]
@@ -129,13 +136,42 @@ assert_json "$OUT" '.message_id == 1' "send returns message_id"
 assert_json "$OUT" '.chat_id == 456' "send returns chat_id"
 
 # Verify POST body
-POSTED=$(cat "$MOCK_DIR/last-post.json" 2>/dev/null)
+POSTED=$(cat "$MOCK_DIR/last-post.txt" 2>/dev/null)
 assert_json "$POSTED" '.chat_id == "456"' "send posts correct chat_id"
 assert_json "$POSTED" '.text == "hello world"' "send posts correct text"
 
 # Missing args
 OUT=$(run send 2>/dev/null) || true
 assert_json "$OUT" '.error' "send missing args gives error"
+
+echo ""
+
+# ── sendVoice ──
+
+echo "sendVoice:"
+
+VOICE_FILE=$(mktemp)
+echo "fake-opus-data" > "$VOICE_FILE"
+
+OUT=$(run sendVoice 456 "$VOICE_FILE")
+assert_json "$OUT" '.message_id == 2' "sendVoice returns message_id"
+assert_json "$OUT" '.chat_id == 456' "sendVoice returns chat_id"
+assert_json "$OUT" '.duration == 5' "sendVoice returns duration"
+
+# Verify multipart body contains chat_id and file content
+POSTED=$(cat "$MOCK_DIR/last-post.txt" 2>/dev/null)
+assert_contains "$POSTED" "456" "sendVoice posts chat_id"
+assert_contains "$POSTED" "fake-opus-data" "sendVoice posts voice file content"
+
+# Missing args
+OUT=$(run sendVoice 2>/dev/null) || true
+assert_json "$OUT" '.error' "sendVoice missing args gives error"
+
+# Missing file
+OUT=$(run sendVoice 456 /nonexistent/path 2>/dev/null) || true
+assert_contains "$OUT" "file not found" "sendVoice missing file gives error"
+
+rm -f "$VOICE_FILE"
 
 echo ""
 
