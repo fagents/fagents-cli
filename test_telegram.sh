@@ -187,6 +187,40 @@ assert_json "$OUT" '.chat_id == 789' "poll returns chat_id"
 assert_json "$OUT" '.from == "tester"' "poll returns from username"
 assert_json "$OUT" '.text == "hello"' "poll returns text"
 assert_json "$OUT" '.date == 1709600000' "poll returns date"
+assert_json "$OUT" '.type == "text"' "poll text message has type text"
+
+echo ""
+
+# ── poll voice messages ──
+
+echo "poll (voice):"
+
+set_mock getUpdates '{"ok":true,"result":[{"update_id":150,"message":{"message_id":10,"chat":{"id":789,"type":"private"},"from":{"id":1,"is_bot":false,"first_name":"Tester","username":"tester"},"voice":{"duration":3,"file_id":"voice-file-abc","file_unique_id":"unique123","file_size":4096},"date":1709600010}}]}'
+
+OUT=$(run poll)
+assert_json "$OUT" '.type == "voice"' "poll voice message has type voice"
+assert_json "$OUT" '.file_id == "voice-file-abc"' "poll voice message has file_id"
+assert_json "$OUT" '.duration == 3' "poll voice message has duration"
+assert_json "$OUT" '.text == null' "poll voice message has null text"
+assert_json "$OUT" '.chat_id == 789' "poll voice message has chat_id"
+assert_json "$OUT" '.from == "tester"' "poll voice message has from"
+
+echo ""
+
+# ── poll mixed text + voice ──
+
+echo "poll (mixed text + voice):"
+
+set_mock getUpdates '{"ok":true,"result":[{"update_id":160,"message":{"message_id":11,"chat":{"id":789,"type":"private"},"from":{"id":1,"is_bot":false,"first_name":"Tester","username":"tester"},"text":"text msg","date":1709600020}},{"update_id":161,"message":{"message_id":12,"chat":{"id":789,"type":"private"},"from":{"id":1,"is_bot":false,"first_name":"Tester","username":"tester"},"voice":{"duration":5,"file_id":"voice-file-def","file_unique_id":"unique456","file_size":8192},"date":1709600021}}]}'
+
+OUT=$(run poll)
+LINES=$(echo "$OUT" | wc -l | tr -d ' ')
+assert_eq "2" "$LINES" "poll outputs both text and voice messages"
+LINE1=$(echo "$OUT" | head -1)
+LINE2=$(echo "$OUT" | tail -1)
+assert_json "$LINE1" '.type == "text"' "first message is text"
+assert_json "$LINE2" '.type == "voice"' "second message is voice"
+assert_json "$LINE2" '.file_id == "voice-file-def"' "voice message has correct file_id"
 
 echo ""
 
@@ -233,8 +267,8 @@ set_mock getUpdates '{"ok":true,"result":[{"update_id":300,"message":{"message_i
 
 OUT=$(run poll)
 LINES=$(echo "$OUT" | wc -l | tr -d ' ')
-assert_eq "1" "$LINES" "poll filters to text messages only"
-assert_json "$OUT" '.text == "real msg"' "poll returns only text message"
+assert_eq "1" "$LINES" "poll filters to text+voice only (skips edits, callbacks)"
+assert_json "$OUT" '.text == "real msg"' "poll returns the text message"
 
 echo ""
 

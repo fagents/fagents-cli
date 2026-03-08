@@ -11,7 +11,7 @@
 #   telegram.sh whoami                        — verify bot token (getMe)
 #   telegram.sh send <chat-id> <message>      — send message to chat
 #   telegram.sh sendVoice <chat-id> <file>    — send voice message (OGG/Opus)
-#   telegram.sh poll                          — get new DMs (one JSON line per message)
+#   telegram.sh poll                          — get new DMs (text + voice, one JSON line per message)
 
 set -euo pipefail
 
@@ -131,9 +131,9 @@ case "$cmd" in
         wrote=0
         while IFS= read -r update; do
             [[ -z "$update" ]] && continue
-            # Filter: only message updates with text (skip edits, callbacks, etc.)
-            has_text=$(echo "$update" | jq -r 'select(.message.text) | .update_id' 2>/dev/null)
-            [[ -z "$has_text" ]] && continue
+            # Filter: text or voice messages only (skip edits, callbacks, etc.)
+            has_content=$(echo "$update" | jq -r 'select(.message.text // .message.voice) | .update_id' 2>/dev/null)
+            [[ -z "$has_content" ]] && continue
 
             # Gate: skip messages from users not in TELEGRAM_ALLOWED_IDS
             if [[ -n "$ALLOWED" ]]; then
@@ -141,13 +141,29 @@ case "$cmd" in
                 [[ ",$ALLOWED," == *",$from_id,"* ]] || continue
             fi
 
-            echo "$update" | jq -c '{
-                update_id: .update_id,
-                chat_id: .message.chat.id,
-                from: (.message.from.username // .message.from.first_name // "unknown"),
-                text: .message.text,
-                date: .message.date
-            }'
+            # Output: voice messages include file_id + duration, text messages include text
+            is_voice=$(echo "$update" | jq -r 'select(.message.voice) | "yes"' 2>/dev/null)
+            if [[ "$is_voice" == "yes" ]]; then
+                echo "$update" | jq -c '{
+                    update_id: .update_id,
+                    chat_id: .message.chat.id,
+                    from: (.message.from.username // .message.from.first_name // "unknown"),
+                    text: null,
+                    date: .message.date,
+                    type: "voice",
+                    file_id: .message.voice.file_id,
+                    duration: .message.voice.duration
+                }'
+            else
+                echo "$update" | jq -c '{
+                    update_id: .update_id,
+                    chat_id: .message.chat.id,
+                    from: (.message.from.username // .message.from.first_name // "unknown"),
+                    text: .message.text,
+                    date: .message.date,
+                    type: "text"
+                }'
+            fi
             wrote=1
 
             uid=$(echo "$update" | jq '.update_id' 2>/dev/null)
@@ -171,7 +187,7 @@ case "$cmd" in
                 whoami: "whoami — verify bot token (getMe)",
                 send: "send <chat-id> <message> — send message to chat",
                 sendVoice: "sendVoice <chat-id> <voice-file> — send voice message (OGG/Opus)",
-                poll: "poll — get new DMs (one JSON line per message)"
+                poll: "poll — get new DMs: text + voice (one JSON line per message)"
             },
             flags: ["--token <bot-token>", "--api-base <url>"],
             notes: "Without --token, must be called via: sudo -u fagents telegram.sh"
