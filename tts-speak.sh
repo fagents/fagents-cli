@@ -23,7 +23,7 @@ API_KEY=""
 BOT_TOKEN=""
 VOICE="alloy"
 MODEL="tts-1"
-MAX_CHARS=800
+MAX_CHARS=4096
 INPUT_FILE=""
 
 err() {
