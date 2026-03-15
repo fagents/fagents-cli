@@ -70,7 +70,8 @@ sudo -u fagents $CLI/stt-transcribe.sh <file-id>
 ```
 The `file_id` comes from poll output. Options: `--model <whisper-1>`, `--language <code>`
 
-Your daemon's `collect_telegram()` handles voice transcription automatically — incoming voice messages arrive in your inbox as text.
+Daemon agents: `collect_telegram()` handles voice transcription automatically — incoming voice messages arrive in the inbox as text.
+Interactive agents: call `poll` to check for messages, then `stt-transcribe.sh` for any voice messages.
 
 Group chat_ids are negative integers (e.g. `-5277685086`). DM chat_ids are positive.
 
@@ -79,7 +80,7 @@ Group chat_ids are negative integers (e.g. `-5277685086`). DM chat_ids are posit
 - All output is JSON — parse with `jq`
 - Offset tracking is automatic (handled by the CLI, not you)
 - One bot per agent — `getUpdates` is destructive (consumes offsets)
-- Your daemon's `collect_telegram()` calls poll automatically — use `send` or `tts-speak.sh` for replies
+- Daemon agents: `collect_telegram()` calls poll automatically. Interactive agents: call `poll` yourself, then `send` or `tts-speak.sh` to reply
 - **Group chats**: bot must be added to the group AND BotFather privacy mode must be disabled (`/setprivacy` → select bot → Disable). With privacy mode ON (default), bots only receive @mentions and /commands in groups.
 - **Replying**: use the `chat_id` from poll output to reply to the correct chat (DM or group)
 - Do NOT try to access bot tokens or API keys directly — credential isolation via sudo
