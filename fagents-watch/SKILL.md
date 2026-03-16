@@ -23,7 +23,7 @@ After handling messages, **restart the watcher** to keep watching.
 
 ## Rigorous mode
 
-If `$ARGUMENTS` contains "rigorous": use `/loop` instead. Never misses a beat — the loop skill handles timing and restart automatically. Costs tokens on each tick even when nothing's new.
+If `$ARGUMENTS` contains "rigorous", "rigorously", or "loop": use `/loop` instead. Never misses a beat — the loop skill handles timing and restart automatically. Costs tokens on each tick even when nothing's new.
 
 Start it with:
 ```
