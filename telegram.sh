@@ -141,10 +141,19 @@ case "$cmd" in
                 [[ ",$ALLOWED," == *",$from_id,"* ]] || continue
             fi
 
+            # Build reply_to context if this message is a reply
+            reply_to=$(echo "$update" | jq -c '
+                .message.reply_to_message // empty |
+                {
+                    from: (.from.username // .from.first_name // "unknown"),
+                    text: (.text // null),
+                    date: .date
+                }' 2>/dev/null) || true
+
             # Output: voice messages include file_id + duration, text messages include text
             is_voice=$(echo "$update" | jq -r 'select(.message.voice) | "yes"' 2>/dev/null)
             if [[ "$is_voice" == "yes" ]]; then
-                echo "$update" | jq -c '{
+                echo "$update" | jq -c --argjson reply "${reply_to:-null}" '{
                     update_id: .update_id,
                     chat_id: .message.chat.id,
                     from: (.message.from.username // .message.from.first_name // "unknown"),
@@ -153,16 +162,16 @@ case "$cmd" in
                     type: "voice",
                     file_id: .message.voice.file_id,
                     duration: .message.voice.duration
-                }'
+                } + if $reply then {reply_to: $reply} else {} end'
             else
-                echo "$update" | jq -c '{
+                echo "$update" | jq -c --argjson reply "${reply_to:-null}" '{
                     update_id: .update_id,
                     chat_id: .message.chat.id,
                     from: (.message.from.username // .message.from.first_name // "unknown"),
                     text: .message.text,
                     date: .message.date,
                     type: "text"
-                }'
+                } + if $reply then {reply_to: $reply} else {} end'
             fi
             wrote=1
 

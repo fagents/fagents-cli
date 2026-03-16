@@ -270,6 +270,25 @@ LINES=$(echo "$OUT" | wc -l | tr -d ' ')
 assert_eq "1" "$LINES" "poll filters to text+voice only (skips edits, callbacks)"
 assert_json "$OUT" '.text == "real msg"' "poll returns the text message"
 
+# ── poll reply_to ──
+
+echo ""
+echo "poll (reply_to):"
+
+set_mock getUpdates '{"ok":true,"result":[{"update_id":500,"message":{"message_id":20,"chat":{"id":789,"type":"group"},"from":{"id":1,"is_bot":false,"first_name":"Tester","username":"tester"},"text":"@bot check this","date":1709600020,"reply_to_message":{"message_id":19,"chat":{"id":789,"type":"group"},"from":{"id":2,"is_bot":false,"first_name":"Alice","username":"alice"},"text":"original message here","date":1709600010}}}]}'
+
+OUT=$(run poll)
+assert_json "$OUT" '.reply_to.from == "alice"' "reply_to includes original sender"
+assert_json "$OUT" '.reply_to.text == "original message here"' "reply_to includes original text"
+assert_json "$OUT" '.reply_to.date == 1709600010' "reply_to includes original date"
+assert_json "$OUT" '.text == "@bot check this"' "reply message text preserved"
+
+# Non-reply message should not have reply_to
+set_mock getUpdates '{"ok":true,"result":[{"update_id":501,"message":{"message_id":21,"chat":{"id":789,"type":"private"},"from":{"id":1,"is_bot":false,"first_name":"Tester","username":"tester"},"text":"no reply","date":1709600021}}]}'
+
+OUT=$(run poll)
+assert_json "$OUT" '.reply_to == null' "non-reply message has no reply_to"
+
 echo ""
 
 # ── credential errors ──
