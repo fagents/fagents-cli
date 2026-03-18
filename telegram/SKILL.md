@@ -1,7 +1,7 @@
 ---
 name: telegram
-description: Send and receive Telegram messages (text + voice) via Bot API.
-argument-hint: "[send|sendVoice|poll|whoami] [args...]"
+description: Send and receive Telegram messages (text, voice, photos, documents) via Bot API.
+argument-hint: "[send|sendVoice|poll|download|whoami] [args...]"
 allowed-tools: Bash(sudo -u fagents */telegram.sh *),Bash(sudo -u fagents */tts-speak.sh *),Bash(sudo -u fagents */stt-transcribe.sh *)
 ---
 
@@ -39,20 +39,26 @@ sudo -u fagents $CLI/telegram.sh sendVoice <chat-id> <voice-file.ogg>
 ```
 
 ### poll
-Check for new messages (DMs and group chats). Returns one JSON line per message, exits 1 if no new messages. Detects both text and voice messages.
+Check for new messages (DMs and group chats). Returns one JSON line per message, exits 1 if no new messages. Detects text, voice, photo, document, video, audio, and sticker messages.
 ```bash
 sudo -u fagents $CLI/telegram.sh poll
 ```
 
-Text message output:
-```json
-{"update_id":123,"chat_id":456,"from":"username","text":"hello","date":1709600000,"type":"text"}
-```
+Text: `{"type":"text", "text":"hello", ...}`
+Photo: `{"type":"photo", "file_id":"...", "text":"caption or null", "file_size":50000, ...}`
+Document: `{"type":"document", "file_id":"...", "filename":"report.pdf", "mime_type":"application/pdf", ...}`
+Voice: `{"type":"voice", "file_id":"...", "duration":3, ...}`
+Video/Audio/Sticker: similar, with `file_id` and type-specific fields.
 
-Voice message output:
-```json
-{"update_id":124,"chat_id":456,"from":"username","text":null,"date":1709600001,"type":"voice","file_id":"AwACAgIA...","duration":3}
+### download
+Download an attachment by `file_id` (from poll output). Returns path and size.
+```bash
+sudo -u fagents $CLI/telegram.sh download <file-id> [output-dir]
 ```
+Output: `{"path":"./file_0.pdf", "filename":"file_0.pdf", "size":120000}`
+
+Daemon agents: attachment messages arrive in the inbox with the download command pre-formatted — just run it.
+Interactive agents: call `poll`, grab the `file_id`, then `download`.
 
 ## Voice
 
