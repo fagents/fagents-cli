@@ -267,7 +267,7 @@ set_mock getUpdates '{"ok":true,"result":[{"update_id":300,"message":{"message_i
 
 OUT=$(run poll)
 LINES=$(echo "$OUT" | wc -l | tr -d ' ')
-assert_eq "1" "$LINES" "poll filters to text+voice only (skips edits, callbacks)"
+assert_eq "1" "$LINES" "poll filters to messages only (skips edits, callbacks)"
 assert_json "$OUT" '.text == "real msg"' "poll returns the text message"
 
 # ── poll reply_to ──
@@ -365,6 +365,107 @@ set_mock getUpdates '{"ok":true,"result":[{"update_id":400,"message":{"message_i
 OUT=$(TELEGRAM_ALLOWED_IDS="42,99" run poll)
 LINES=$(echo "$OUT" | wc -l | tr -d ' ')
 assert_eq "2" "$LINES" "gate allows multiple comma-separated user IDs"
+
+echo ""
+
+# ── poll photo ──
+
+echo "poll (photo):"
+
+set_mock getUpdates '{"ok":true,"result":[{"update_id":500,"message":{"message_id":50,"chat":{"id":789,"type":"private"},"from":{"id":1,"is_bot":false,"first_name":"Tester","username":"tester"},"photo":[{"file_id":"photo-small","file_unique_id":"s1","file_size":1000,"width":90,"height":90},{"file_id":"photo-large","file_unique_id":"s2","file_size":50000,"width":800,"height":600}],"caption":"look at this","date":1709600050}}]}'
+
+OUT=$(run poll)
+assert_json "$OUT" '.type == "photo"' "poll photo has type photo"
+assert_json "$OUT" '.file_id == "photo-large"' "poll photo picks largest (last) file_id"
+assert_json "$OUT" '.text == "look at this"' "poll photo includes caption as text"
+assert_json "$OUT" '.file_size == 50000' "poll photo has file_size"
+assert_json "$OUT" '.chat_id == 789' "poll photo has chat_id"
+
+echo ""
+
+# ── poll document ──
+
+echo "poll (document):"
+
+set_mock getUpdates '{"ok":true,"result":[{"update_id":510,"message":{"message_id":51,"chat":{"id":789,"type":"private"},"from":{"id":1,"is_bot":false,"first_name":"Tester","username":"tester"},"document":{"file_id":"doc-abc","file_unique_id":"d1","file_name":"report.pdf","mime_type":"application/pdf","file_size":120000},"date":1709600060}}]}'
+
+OUT=$(run poll)
+assert_json "$OUT" '.type == "document"' "poll document has type document"
+assert_json "$OUT" '.file_id == "doc-abc"' "poll document has file_id"
+assert_json "$OUT" '.filename == "report.pdf"' "poll document has filename"
+assert_json "$OUT" '.mime_type == "application/pdf"' "poll document has mime_type"
+
+echo ""
+
+# ── poll video ──
+
+echo "poll (video):"
+
+set_mock getUpdates '{"ok":true,"result":[{"update_id":520,"message":{"message_id":52,"chat":{"id":789,"type":"private"},"from":{"id":1,"is_bot":false,"first_name":"Tester","username":"tester"},"video":{"file_id":"vid-xyz","file_unique_id":"v1","duration":15,"file_size":2000000},"caption":"check this out","date":1709600070}}]}'
+
+OUT=$(run poll)
+assert_json "$OUT" '.type == "video"' "poll video has type video"
+assert_json "$OUT" '.file_id == "vid-xyz"' "poll video has file_id"
+assert_json "$OUT" '.duration == 15' "poll video has duration"
+assert_json "$OUT" '.text == "check this out"' "poll video includes caption"
+
+echo ""
+
+# ── poll sticker ──
+
+echo "poll (sticker):"
+
+set_mock getUpdates '{"ok":true,"result":[{"update_id":530,"message":{"message_id":53,"chat":{"id":789,"type":"private"},"from":{"id":1,"is_bot":false,"first_name":"Tester","username":"tester"},"sticker":{"file_id":"sticker-123","file_unique_id":"st1","emoji":"🐢","type":"regular"},"date":1709600080}}]}'
+
+OUT=$(run poll)
+assert_json "$OUT" '.type == "sticker"' "poll sticker has type sticker"
+assert_json "$OUT" '.file_id == "sticker-123"' "poll sticker has file_id"
+assert_json "$OUT" '.emoji == "🐢"' "poll sticker has emoji"
+
+echo ""
+
+# ── poll audio ──
+
+echo "poll (audio):"
+
+set_mock getUpdates '{"ok":true,"result":[{"update_id":540,"message":{"message_id":54,"chat":{"id":789,"type":"private"},"from":{"id":1,"is_bot":false,"first_name":"Tester","username":"tester"},"audio":{"file_id":"audio-mp3","file_unique_id":"a1","duration":180,"file_name":"song.mp3"},"date":1709600090}}]}'
+
+OUT=$(run poll)
+assert_json "$OUT" '.type == "audio"' "poll audio has type audio"
+assert_json "$OUT" '.file_id == "audio-mp3"' "poll audio has file_id"
+assert_json "$OUT" '.filename == "song.mp3"' "poll audio has filename"
+assert_json "$OUT" '.duration == 180' "poll audio has duration"
+
+echo ""
+
+# ── poll filters still work with attachments ──
+
+echo "poll (filtering with attachments):"
+
+set_mock getUpdates '{"ok":true,"result":[{"update_id":550,"message":{"message_id":55,"chat":{"id":789,"type":"private"},"from":{"id":1,"is_bot":false,"first_name":"Tester","username":"tester"},"photo":[{"file_id":"p1","file_unique_id":"u1","file_size":1000}],"date":1709600100}},{"update_id":551,"edited_message":{"message_id":1,"chat":{"id":789},"text":"edited","date":1709600101}},{"update_id":552,"message":{"message_id":56,"chat":{"id":789,"type":"private"},"from":{"id":1,"is_bot":false,"first_name":"Tester","username":"tester"},"document":{"file_id":"d1","file_unique_id":"u2","file_name":"test.txt"},"date":1709600102}}]}'
+
+OUT=$(run poll)
+LINES=$(echo "$OUT" | wc -l | tr -d ' ')
+assert_eq "2" "$LINES" "poll with attachments skips edits, keeps photo+doc"
+
+echo ""
+
+# ── download ──
+
+echo "download:"
+
+# Set up mock for getFile + file download
+set_mock getFile '{"ok":true,"result":{"file_id":"doc-abc","file_path":"documents/file_0.pdf"}}'
+# The mock server serves the file content at /file/bot.../documents/file_0.pdf
+# We need to add this route — for now just test the getFile call and error cases
+
+# Missing args
+OUT=$(run download 2>/dev/null) || true
+assert_json "$OUT" '.error' "download missing args gives error"
+
+# Bad output dir
+OUT=$(run download "some-file-id" "/nonexistent/dir" 2>/dev/null) || true
+assert_contains "$OUT" "directory not found" "download bad dir gives error"
 
 echo ""
 

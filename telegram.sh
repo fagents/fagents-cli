@@ -11,7 +11,8 @@
 #   telegram.sh whoami                        — verify bot token (getMe)
 #   telegram.sh send <chat-id> <message>      — send message to chat
 #   telegram.sh sendVoice <chat-id> <file>    — send voice message (OGG/Opus)
-#   telegram.sh poll                          — get new DMs (text + voice, one JSON line per message)
+#   telegram.sh poll                          — get new DMs (text + voice + attachments, one JSON per msg)
+#   telegram.sh download <file-id> [dir]      — download file by file_id, outputs {path, size}
 
 set -euo pipefail
 
@@ -131,8 +132,8 @@ case "$cmd" in
         wrote=0
         while IFS= read -r update; do
             [[ -z "$update" ]] && continue
-            # Filter: text or voice messages only (skip edits, callbacks, etc.)
-            has_content=$(echo "$update" | jq -r 'select(.message.text // .message.voice) | .update_id' 2>/dev/null)
+            # Filter: messages with any content (skip edits, callbacks, etc.)
+            has_content=$(echo "$update" | jq -r 'select(.message.text // .message.voice // .message.photo // .message.document // .message.video // .message.audio // .message.sticker) | .update_id' 2>/dev/null)
             [[ -z "$has_content" ]] && continue
 
             # Gate: skip messages from users not in TELEGRAM_ALLOWED_IDS
@@ -150,29 +151,34 @@ case "$cmd" in
                     date: .date
                 }' 2>/dev/null) || true
 
-            # Output: voice messages include file_id + duration, text messages include text
-            is_voice=$(echo "$update" | jq -r 'select(.message.voice) | "yes"' 2>/dev/null)
-            if [[ "$is_voice" == "yes" ]]; then
-                echo "$update" | jq -c --argjson reply "${reply_to:-null}" '{
+            # Detect message type and extract attachment info
+            # Priority: voice > photo > document > video > audio > sticker > text
+            echo "$update" | jq -c --argjson reply "${reply_to:-null}" '
+                .message as $m |
+                {
                     update_id: .update_id,
-                    chat_id: .message.chat.id,
-                    from: (.message.from.username // .message.from.first_name // "unknown"),
-                    text: null,
-                    date: .message.date,
-                    type: "voice",
-                    file_id: .message.voice.file_id,
-                    duration: .message.voice.duration
-                } + if $reply then {reply_to: $reply} else {} end'
-            else
-                echo "$update" | jq -c --argjson reply "${reply_to:-null}" '{
-                    update_id: .update_id,
-                    chat_id: .message.chat.id,
-                    from: (.message.from.username // .message.from.first_name // "unknown"),
-                    text: .message.text,
-                    date: .message.date,
-                    type: "text"
-                } + if $reply then {reply_to: $reply} else {} end'
-            fi
+                    chat_id: $m.chat.id,
+                    from: ($m.from.username // $m.from.first_name // "unknown"),
+                    date: $m.date,
+                    text: ($m.text // $m.caption // null)
+                } +
+                if $m.voice then
+                    {type: "voice", file_id: $m.voice.file_id, duration: $m.voice.duration}
+                elif $m.photo then
+                    {type: "photo", file_id: ($m.photo | last | .file_id), file_size: ($m.photo | last | .file_size)}
+                elif $m.document then
+                    {type: "document", file_id: $m.document.file_id, filename: ($m.document.file_name // null), mime_type: ($m.document.mime_type // null), file_size: ($m.document.file_size // null)}
+                elif $m.video then
+                    {type: "video", file_id: $m.video.file_id, duration: $m.video.duration, file_size: ($m.video.file_size // null)}
+                elif $m.audio then
+                    {type: "audio", file_id: $m.audio.file_id, duration: $m.audio.duration, filename: ($m.audio.file_name // null)}
+                elif $m.sticker then
+                    {type: "sticker", file_id: $m.sticker.file_id, emoji: ($m.sticker.emoji // null)}
+                else
+                    {type: "text"}
+                end +
+                if $reply then {reply_to: $reply} else {} end
+            '
             wrote=1
 
             uid=$(echo "$update" | jq '.update_id' 2>/dev/null)
@@ -190,13 +196,40 @@ case "$cmd" in
         [[ "$wrote" == "1" ]] || exit 1
         ;;
 
+    download)
+        file_id="${1:-}"
+        output_dir="${2:-.}"
+        [[ -n "$file_id" ]] || err "usage: download <file-id> [output-dir]"
+        [[ -d "$output_dir" ]] || err "directory not found: $output_dir"
+
+        # Step 1: getFile — returns file_path on Telegram's servers
+        bot_api GET "getFile?file_id=${file_id}"
+        file_path=$(echo "$BOT_RESP" | jq -r '.result.file_path // empty')
+        [[ -n "$file_path" ]] || err "no file_path returned for file_id: $file_id"
+
+        # Step 2: download from Telegram CDN
+        filename=$(basename "$file_path")
+        output_file="$output_dir/$filename"
+        local_status=$(curl -s -o "$output_file" -w '%{http_code}' --max-time 30 \
+            "${API_BASE}/file/bot${TOKEN}/${file_path}" 2>/dev/null) || err "download failed"
+        [[ "$local_status" -ge 200 ]] && [[ "$local_status" -lt 300 ]] 2>/dev/null || {
+            rm -f "$output_file"
+            err "download failed: HTTP $local_status"
+        }
+
+        file_size=$(wc -c < "$output_file" | tr -d ' ')
+        jq -nc --arg path "$output_file" --arg size "$file_size" --arg name "$filename" \
+            '{path: $path, filename: $name, size: ($size | tonumber)}'
+        ;;
+
     help|--help|-h|*)
         jq -nc '{
             commands: {
                 whoami: "whoami — verify bot token (getMe)",
                 send: "send <chat-id> <message> — send message to chat",
                 sendVoice: "sendVoice <chat-id> <voice-file> — send voice message (OGG/Opus)",
-                poll: "poll — get new DMs: text + voice (one JSON line per message)"
+                poll: "poll — get new DMs: text, voice, photo, document, video, audio, sticker",
+                download: "download <file-id> [dir] — download attachment by file_id"
             },
             flags: ["--token <bot-token>", "--api-base <url>"],
             notes: "Without --token, must be called via: sudo -u fagents telegram.sh"
