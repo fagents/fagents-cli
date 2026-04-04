@@ -209,11 +209,21 @@ async function doLogin() {
                 });
             });
 
-            // Connected — output result and exit
+            // Connected — write env file with self JID, output result, exit
             const me = sock.user;
+            const rawJid = me?.id || '';
+            // Strip device suffix: 358445150070:12@s.whatsapp.net -> 358445150070@s.whatsapp.net
+            const selfJidClean = rawJid.replace(/:\d+@/, '@');
+
+            if (selfJidClean && envFile) {
+                const envContent = `WHATSAPP_ALLOWED_JIDS=${selfJidClean}\nWHATSAPP_SELF_JID=${selfJidClean}\n`;
+                writeFileSync(envFile, envContent);
+                console.error(`Saved self-chat JID to ${envFile}`);
+            }
+
             process.stdout.write(JSON.stringify({
                 ok: true,
-                jid: me?.id || null,
+                jid: selfJidClean || rawJid || null,
                 name: me?.name || me?.verifiedName || null,
             }) + '\n');
             // Wait for creds to flush before exiting
