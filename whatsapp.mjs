@@ -27,6 +27,14 @@ import { randomUUID } from 'node:crypto';
 
 const CREDS_DIR = '/home/fagents/.agents';
 
+// Suppress Baileys internal logging noise
+const silentLogger = {
+    level: 'silent', info: () => {}, warn: () => {}, debug: () => {}, trace: () => {},
+    error: (...a) => console.error('[baileys]', ...a),
+    fatal: (...a) => console.error('[baileys:fatal]', ...a),
+    child: () => silentLogger,
+};
+
 function err(msg) {
     process.stdout.write(JSON.stringify({ error: msg }) + '\n');
     process.exit(1);
@@ -160,16 +168,22 @@ async function doSend() {
 async function doLogin() {
     const baileys = await import('@whiskeysockets/baileys');
     const makeWASocket = baileys.default?.default || baileys.default || baileys.makeWASocket;
-    const { useMultiFileAuthState, DisconnectReason } = baileys;
-    const qrcode = await import('qrcode-terminal');
+    const { useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, DisconnectReason } = baileys;
+    const qrcode = (await import('qrcode-terminal')).default;
 
     if (!existsSync(sessionDir)) mkdirSync(sessionDir, { recursive: true });
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
-        auth: state,
+        auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, silentLogger) },
+        version,
+        logger: silentLogger,
         printQRInTerminal: false,
+        browser: ['fagents', 'cli', '1.0.0'],
+        syncFullHistory: false,
+        markOnlineOnConnect: false,
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -177,8 +191,8 @@ async function doLogin() {
     return new Promise((resolve) => {
         sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
             if (qr) {
-                console.error('Scan this QR code with WhatsApp:');
-                qrcode.generate(qr, { small: true }, (code) => console.error(code));
+                console.error('Scan this QR in WhatsApp > Linked Devices:');
+                qrcode.generate(qr, { small: true });
             }
             if (connection === 'open') {
                 const me = sock.user;
@@ -208,9 +222,10 @@ async function doServe() {
 
     const baileys = await import('@whiskeysockets/baileys');
     const makeWASocket = baileys.default?.default || baileys.default || baileys.makeWASocket;
-    const { useMultiFileAuthState, DisconnectReason, downloadMediaMessage } = baileys;
+    const { useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, DisconnectReason, downloadMediaMessage } = baileys;
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    const { version } = await fetchLatestBaileysVersion();
 
     // Write PID file
     const pidFile = join(dirname(sessionDir), 'whatsapp-serve.pid');
@@ -225,8 +240,13 @@ async function doServe() {
 
     async function connect() {
         sock = makeWASocket({
-            auth: state,
+            auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, silentLogger) },
+            version,
+            logger: silentLogger,
             printQRInTerminal: false,
+            browser: ['fagents', 'cli', '1.0.0'],
+            syncFullHistory: false,
+            markOnlineOnConnect: false,
         });
 
         sock.ev.on('creds.update', saveCreds);
