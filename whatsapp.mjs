@@ -173,45 +173,65 @@ async function doLogin() {
 
     if (!existsSync(sessionDir)) mkdirSync(sessionDir, { recursive: true });
 
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    const { version } = await fetchLatestBaileysVersion();
+    const MAX_RETRIES = 5;
 
-    const sock = makeWASocket({
-        auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, silentLogger) },
-        version,
-        logger: silentLogger,
-        printQRInTerminal: false,
-        browser: ['fagents', 'cli', '1.0.0'],
-        syncFullHistory: false,
-        markOnlineOnConnect: false,
-    });
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+        const { version } = await fetchLatestBaileysVersion();
 
-    sock.ev.on('creds.update', saveCreds);
-
-    return new Promise((resolve) => {
-        sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
-            if (qr) {
-                console.error('Scan this QR in WhatsApp > Linked Devices:');
-                qrcode.generate(qr, { small: true });
-            }
-            if (connection === 'open') {
-                const me = sock.user;
-                process.stdout.write(JSON.stringify({
-                    ok: true,
-                    jid: me?.id || null,
-                    name: me?.name || me?.verifiedName || null,
-                }) + '\n');
-                sock.end(undefined);
-                resolve();
-            }
-            if (connection === 'close') {
-                const code = lastDisconnect?.error?.output?.statusCode;
-                if (code === DisconnectReason?.loggedOut) {
-                    err('Logged out — delete session and re-login');
-                }
-            }
+        const sock = makeWASocket({
+            auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, silentLogger) },
+            version,
+            logger: silentLogger,
+            printQRInTerminal: false,
+            browser: ['fagents', 'cli', '1.0.0'],
+            syncFullHistory: false,
+            markOnlineOnConnect: false,
         });
-    });
+
+        sock.ev.on('creds.update', saveCreds);
+
+        try {
+            await new Promise((resolve, reject) => {
+                sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+                    if (qr) {
+                        console.error('Scan this QR in WhatsApp > Linked Devices:');
+                        qrcode.generate(qr, { small: true });
+                    }
+                    if (connection === 'open') resolve(sock);
+                    if (connection === 'close') {
+                        const code = lastDisconnect?.error?.output?.statusCode;
+                        if (code === DisconnectReason?.loggedOut) {
+                            reject(new Error('Logged out — delete session and re-login'));
+                        } else {
+                            reject({ retryable: true, code });
+                        }
+                    }
+                });
+            });
+
+            // Connected — output result and exit
+            const me = sock.user;
+            process.stdout.write(JSON.stringify({
+                ok: true,
+                jid: me?.id || null,
+                name: me?.name || me?.verifiedName || null,
+            }) + '\n');
+            // Wait for creds to flush before exiting
+            await new Promise(r => setTimeout(r, 2000));
+            sock.end(undefined);
+            return;
+        } catch (e) {
+            if (e instanceof Error) err(e.message); // non-retryable (logged out)
+            if (e.retryable && attempt < MAX_RETRIES) {
+                const delay = attempt * 2;
+                console.error(`Connection failed (code ${e.code}), retrying in ${delay}s... (${attempt}/${MAX_RETRIES})`);
+                await new Promise(r => setTimeout(r, delay * 1000));
+                continue;
+            }
+            err(`Login failed after ${attempt} attempts (code ${e.code})`);
+        }
+    }
 }
 
 // ── serve: long-running Baileys relay ──
