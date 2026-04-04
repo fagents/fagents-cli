@@ -93,6 +93,25 @@ function clearOutbox() {
 console.log('=== whatsapp.mjs tests ===');
 console.log('');
 
+// ── Baileys socket config (source checks) ──
+// These prevent regression of the noise-handler bug: makeWASocket MUST be
+// called with fetchLatestBaileysVersion() and makeCacheableSignalKeyStore().
+
+console.log('baileys config:');
+
+const src = readFileSync(CLI, 'utf8');
+assertContains(src, 'fetchLatestBaileysVersion', 'source uses fetchLatestBaileysVersion');
+assertContains(src, 'makeCacheableSignalKeyStore', 'source uses makeCacheableSignalKeyStore');
+// Verify both doLogin and doServe use version param
+const loginBlock = src.slice(src.indexOf('async function doLogin'), src.indexOf('async function doServe'));
+const serveBlock = src.slice(src.indexOf('async function doServe'), src.indexOf('function doWhoami'));
+assertContains(loginBlock, 'version', 'doLogin passes version to makeWASocket');
+assertContains(loginBlock, 'makeCacheableSignalKeyStore', 'doLogin uses signal key cache');
+assertContains(serveBlock, 'version', 'doServe passes version to makeWASocket');
+assertContains(serveBlock, 'makeCacheableSignalKeyStore', 'doServe uses signal key cache');
+
+console.log('');
+
 // ── help ──
 
 console.log('help:');
