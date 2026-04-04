@@ -99,6 +99,7 @@ const cmd = args.shift() || 'help';
 
 switch (cmd) {
     case 'login':  await doLogin(); break;
+    case 'logout': doLogout(); break;
     case 'serve':  await doServe(); break;
     case 'poll':   doPoll(); break;
     case 'send':   await doSend(); break;
@@ -230,6 +231,20 @@ async function doLogin() {
             err(`Login failed after ${attempt} attempts (code ${e.code})`);
         }
     }
+}
+
+// ── logout: clear session to allow re-login ──
+
+function doLogout() {
+    if (!existsSync(sessionDir)) {
+        process.stdout.write(JSON.stringify({ ok: true, note: 'no session to clear' }) + '\n');
+        return;
+    }
+    const files = readdirSync(sessionDir);
+    for (const f of files) {
+        try { unlinkSync(join(sessionDir, f)); } catch {}
+    }
+    process.stdout.write(JSON.stringify({ ok: true, cleared: files.length }) + '\n');
 }
 
 // ── serve: long-running Baileys relay ──
@@ -441,7 +456,8 @@ function doWhoami() {
 function doHelp() {
     process.stdout.write(JSON.stringify({
         commands: {
-            login: 'login — scan QR code to link WhatsApp',
+            login: 'login — scan QR code to link WhatsApp (retries on timeout)',
+            logout: 'logout — clear session to allow re-login',
             serve: 'serve — long-running: relay messages via spool files',
             poll: 'poll — read + drain incoming spool (JSON lines)',
             send: 'send <jid> <message> — queue outgoing message',
