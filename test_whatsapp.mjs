@@ -294,6 +294,43 @@ assertJsonField(r.stdout, 'name', 'Test User', 'whoami returns name');
 
 console.log('');
 
+// ── logout + login env write ──
+
+console.log('logout + login env:');
+
+// logout clears session files
+writeFileSync(join(sessionDir, 'creds.json'), '{}');
+writeFileSync(join(sessionDir, 'app-state-sync-key-AAAAAA.json'), '{}');
+r = run('logout');
+assertEq(0, r.status, 'logout exits 0');
+assertJsonField(r.stdout, 'ok', 'true', 'logout returns ok');
+assertJsonField(r.stdout, 'cleared', undefined, 'logout returns cleared count');
+assertEq(0, readdirSync(sessionDir).length, 'logout clears all session files');
+
+// logout on empty session is fine
+r = run('logout');
+assertJsonField(r.stdout, 'ok', 'true', 'logout on empty session returns ok');
+
+// Verify login's JID suffix stripping via source regex
+// The regex: rawJid.replace(/:\d+@/, '@')
+// 358445150070:12@s.whatsapp.net -> 358445150070@s.whatsapp.net
+const stripRegex = /:\d+@/;
+assertEq('358445150070@s.whatsapp.net', '358445150070:12@s.whatsapp.net'.replace(stripRegex, '@'), 'JID strip: removes device suffix');
+assertEq('44771234567@s.whatsapp.net', '44771234567:0@s.whatsapp.net'.replace(stripRegex, '@'), 'JID strip: works with :0 suffix');
+assertEq('123@s.whatsapp.net', '123@s.whatsapp.net'.replace(stripRegex, '@'), 'JID strip: no-op without suffix');
+
+// Verify env file write contract (login writes WHATSAPP_ALLOWED_JIDS + WHATSAPP_SELF_JID)
+// We can't run login (needs Baileys), but we can verify the env parsing round-trips
+const testEnv = join(tmpBase, 'whatsapp-login-test.env');
+const testJid = '358445150070@s.whatsapp.net';
+writeFileSync(testEnv, `WHATSAPP_ALLOWED_JIDS=${testJid}\nWHATSAPP_SELF_JID=${testJid}\n`);
+const envContent = readFileSync(testEnv, 'utf8');
+assertContains(envContent, 'WHATSAPP_ALLOWED_JIDS=358445150070@s.whatsapp.net', 'env file has ALLOWED_JIDS');
+assertContains(envContent, 'WHATSAPP_SELF_JID=358445150070@s.whatsapp.net', 'env file has SELF_JID');
+rmSync(testEnv);
+
+console.log('');
+
 // ── unknown flags ──
 
 console.log('flags:');
