@@ -27,12 +27,10 @@ import { randomUUID } from 'node:crypto';
 
 const CREDS_DIR = '/home/fagents/.agents';
 
-// Suppress Baileys internal logging noise
+// Suppress Baileys internal logging noise (fully silent — errors handled via connection.update)
 const silentLogger = {
     level: 'silent', info: () => {}, warn: () => {}, debug: () => {}, trace: () => {},
-    error: (...a) => console.error('[baileys]', ...a),
-    fatal: (...a) => console.error('[baileys:fatal]', ...a),
-    child: () => silentLogger,
+    error: () => {}, fatal: () => {}, child: () => silentLogger,
 };
 
 function err(msg) {
@@ -220,7 +218,7 @@ async function doLogin() {
             // Wait for creds to flush before exiting
             await new Promise(r => setTimeout(r, 2000));
             sock.end(undefined);
-            return;
+            process.exit(0);
         } catch (e) {
             if (e instanceof Error) err(e.message); // non-retryable (logged out)
             if (e.retryable && attempt < MAX_RETRIES) {
