@@ -1,0 +1,469 @@
+#!/usr/bin/env node
+// nostr.mjs -- agent-first NIP-17 DM client over Nostr relays.
+// All output is JSON. Agents are the users.
+//
+// Architecture (clone of whatsapp.mjs):
+//   serve: long-running. Subscribes to kind:1059 gift wraps p-tagged to us
+//          on every relay in NOSTR_RELAYS. Unwraps via nip17, verifies seal
+//          signature + rumor.id + anti-impersonation, allow-lists by pubkey,
+//          writes to nostr-spool/. Watches nostr-outbox/, builds NIP-17
+//          envelopes via nip17.wrapEvent, publishes to relays (at-least-one-OK).
+//   poll:  reads + deletes nostr-spool/*.jsonl -> one JSON line per msg.
+//   send:  writes {to_npub, body} to nostr-outbox/ -> serve picks up.
+//
+// Credential loading mirrors whatsapp.mjs:
+//   --env-file, --spool-dir, --outbox-dir flags for testing.
+//   Otherwise, via: sudo -u fagents node nostr.mjs <command>; SUDO_USER -> CREDS_DIR.
+//
+// Commands:
+//   nostr.mjs login [--nsec <key>]   -- generate or import nsec; MERGE env
+//   nostr.mjs logout                 -- clear NOSTR_NSEC line; keep rest
+//   nostr.mjs serve                  -- long-running relay subscriber + outbox sender
+//   nostr.mjs poll                   -- drain spool to stdout
+//   nostr.mjs send <npub> <body>     -- queue outgoing DM
+//   nostr.mjs whoami                 -- print {npub, relays, allowed_npubs_count}
+//   nostr.mjs help
+
+import {
+    readFileSync, writeFileSync, readdirSync, unlinkSync, existsSync,
+    mkdirSync, chmodSync, renameSync, statSync, watch,
+} from 'node:fs';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
+import {
+    nip17, nip19, nip44,
+    finalizeEvent, generateSecretKey, getEventHash, getPublicKey, verifyEvent,
+} from 'nostr-tools';
+import WebSocket from 'ws';
+
+// Platform-aware default for the credentials dir. Order:
+//   1. FAGENTS_AGENTS_DIR env var (preserved when running outside sudo)
+//   2. Auto-detect: /Users/fagents/.agents (macOS) if it exists, else
+//      /home/fagents/.agents (Linux default)
+// The daemon passes --env-file / --spool-dir / --outbox-dir / --pid-file
+// explicitly so CREDS_DIR is irrelevant for the daemon's sudo-bridged calls.
+// CREDS_DIR is only used by ad-hoc CLI invocations (whoami, send, etc.) that
+// rely on defaults. Auto-detect makes those work on macOS even when sudo
+// strips FAGENTS_AGENTS_DIR.
+function defaultCredsDir() {
+    if (process.env.FAGENTS_AGENTS_DIR) return process.env.FAGENTS_AGENTS_DIR;
+    for (const c of ['/Users/fagents/.agents', '/home/fagents/.agents']) {
+        try { if (existsSync(c)) return c; } catch {}
+    }
+    return '/home/fagents/.agents';
+}
+const CREDS_DIR = defaultCredsDir();
+
+function err(msg) {
+    process.stdout.write(JSON.stringify({ error: msg }) + '\n');
+    process.exit(1);
+}
+
+// ── Arg parsing ──
+
+const args = process.argv.slice(2);
+let envFile = '';
+let spoolDir = '';
+let outboxDir = '';
+let pidFile = '';
+
+flagLoop: while (args.length && args[0].startsWith('--')) {
+    const flag = args.shift();
+    switch (flag) {
+        case '--env-file':   envFile = args.shift() || ''; break;
+        case '--spool-dir':  spoolDir = args.shift() || ''; break;
+        case '--outbox-dir': outboxDir = args.shift() || ''; break;
+        case '--pid-file':   pidFile = args.shift() || ''; break;
+        default: args.unshift(flag); break flagLoop;
+    }
+}
+
+const caller = process.env.SUDO_USER || '';
+if (!envFile && caller)   envFile = `${CREDS_DIR}/${caller}/nostr.env`;
+if (!spoolDir && caller)  spoolDir = `${CREDS_DIR}/${caller}/nostr-spool`;
+if (!outboxDir && caller) outboxDir = `${CREDS_DIR}/${caller}/nostr-outbox`;
+if (!pidFile && caller)   pidFile = `${CREDS_DIR}/${caller}/.nostr-serve.pid`;
+
+if (!envFile) err('env file required: --env-file <path> or run via sudo -u <user>');
+
+// ── Env helpers ──
+
+function parseEnv(path) {
+    const out = {};
+    if (!existsSync(path)) return out;
+    for (const line of readFileSync(path, 'utf8').split('\n')) {
+        const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+        if (m) out[m[1]] = m[2];
+    }
+    return out;
+}
+
+// Atomic merge-write. Preserves keys not in `updates`. Writes mode 0600.
+function writeEnvMerge(path, updates) {
+    const existing = parseEnv(path);
+    const merged = { ...existing };
+    for (const [k, v] of Object.entries(updates)) {
+        if (v === null) delete merged[k];
+        else merged[k] = v;
+    }
+    const lines = Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
+    const tmp = path + '.tmp';
+    writeFileSync(tmp, lines, { mode: 0o600 });
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, path);
+    chmodSync(path, 0o600);
+}
+
+const DEFAULT_RELAYS = 'wss://relay.damus.io,wss://nos.lol,wss://nostr.wine';
+
+function loadEnv() {
+    const env = parseEnv(envFile);
+    return {
+        nsec: env.NOSTR_NSEC || '',
+        npub: env.NOSTR_NPUB || '',
+        relays: (env.NOSTR_RELAYS || DEFAULT_RELAYS).split(',').map(s => s.trim()).filter(Boolean),
+        allowedNpubs: (env.NOSTR_ALLOWED_NPUBS || '').split(',').map(s => s.trim()).filter(Boolean),
+    };
+}
+
+// ── Validation / encoding helpers ──
+
+function decodeNsec(nsec) {
+    if (!nsec.startsWith('nsec1')) throw new Error('invalid-nsec');
+    const decoded = nip19.decode(nsec);
+    if (decoded.type !== 'nsec') throw new Error('invalid-nsec');
+    return decoded.data; // Uint8Array(32)
+}
+
+function decodeNpub(npub) {
+    if (!npub.startsWith('npub1')) throw new Error('invalid-npub');
+    const decoded = nip19.decode(npub);
+    if (decoded.type !== 'npub') throw new Error('invalid-npub');
+    return decoded.data; // hex string
+}
+
+function allowedSet(allowedNpubs) {
+    const set = new Set();
+    for (const n of allowedNpubs) {
+        try { set.add(decodeNpub(n)); } catch { /* skip malformed entries */ }
+    }
+    return set;
+}
+
+// ── Commands ──
+
+const cmd = args.shift() || 'help';
+
+switch (cmd) {
+    case 'login':  await doLogin(); break;
+    case 'logout': doLogout(); break;
+    case 'serve':  await doServe(); break;
+    case 'poll':   doPoll(); break;
+    case 'send':   await doSend(); break;
+    case 'whoami': doWhoami(); break;
+    case 'help': case '--help': case '-h': default: doHelp(); break;
+}
+
+// ── login: generate or import nsec; MERGE into env ──
+
+async function doLogin() {
+    let nsecArg = '';
+    while (args.length && args[0].startsWith('--')) {
+        const flag = args.shift();
+        if (flag === '--nsec') nsecArg = args.shift() || '';
+        else err(`unknown flag: ${flag}`);
+    }
+
+    let sk;
+    if (nsecArg) {
+        try { sk = decodeNsec(nsecArg); }
+        catch { err('invalid-nsec'); }
+    } else {
+        sk = generateSecretKey();
+    }
+    const pkHex = getPublicKey(sk);
+    const nsecOut = nip19.nsecEncode(sk);
+    const npubOut = nip19.npubEncode(pkHex);
+
+    // MERGE: only set NSEC and NPUB. Initialize NOSTR_RELAYS only if absent.
+    // Leave NOSTR_ALLOWED_NPUBS and any other keys untouched.
+    const existing = parseEnv(envFile);
+    const updates = { NOSTR_NSEC: nsecOut, NOSTR_NPUB: npubOut };
+    if (!existing.NOSTR_RELAYS) updates.NOSTR_RELAYS = DEFAULT_RELAYS;
+
+    writeEnvMerge(envFile, updates);
+
+    const env = loadEnv();
+    process.stdout.write(JSON.stringify({ npub: npubOut, relays: env.relays }) + '\n');
+}
+
+// ── logout: drop NOSTR_NSEC line; keep npub + relays + allow-list ──
+
+function doLogout() {
+    writeEnvMerge(envFile, { NOSTR_NSEC: null });
+    process.stdout.write(JSON.stringify({ logged_out: true }) + '\n');
+}
+
+// ── whoami: print public identity, NEVER nsec ──
+
+function doWhoami() {
+    const env = loadEnv();
+    if (!env.npub) err('not-logged-in');
+    process.stdout.write(JSON.stringify({
+        npub: env.npub,
+        relays: env.relays,
+        allowed_npubs_count: env.allowedNpubs.length,
+    }) + '\n');
+}
+
+// ── poll: drain spool ──
+
+function doPoll() {
+    if (!existsSync(spoolDir)) process.exit(1);
+    const files = readdirSync(spoolDir).filter(f => f.endsWith('.jsonl')).sort();
+    if (files.length === 0) process.exit(1);
+    let wrote = false;
+    for (const f of files) {
+        const fpath = join(spoolDir, f);
+        try {
+            const content = readFileSync(fpath, 'utf8').trim();
+            if (content) {
+                process.stdout.write(content + '\n');
+                wrote = true;
+            }
+            unlinkSync(fpath);
+        } catch { /* concurrent drain — skip */ }
+    }
+    process.exit(wrote ? 0 : 1);
+}
+
+// ── send: queue outgoing via outbox ──
+
+async function doSend() {
+    const npub = args.shift();
+    const body = args.join(' ');
+    if (!npub || !body) err('usage: send <npub> <body>');
+    if (body.includes('\0')) err('null-byte-in-body');
+    try { decodeNpub(npub); }
+    catch { err('invalid-npub'); }
+
+    if (!existsSync(outboxDir)) mkdirSync(outboxDir, { recursive: true, mode: 0o700 });
+
+    const uuid = randomUUID();
+    const fpath = join(outboxDir, `${uuid}.jsonl`);
+    writeFileSync(fpath, JSON.stringify({ to_npub: npub, body, ts: new Date().toISOString() }), { mode: 0o600 });
+    chmodSync(fpath, 0o600);
+
+    // Wait up to 5s for serve to pick it up
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+        if (!existsSync(fpath)) {
+            process.stdout.write(JSON.stringify({ ok: true, to: npub, uuid }) + '\n');
+            return;
+        }
+        await sleep(200);
+    }
+    process.stdout.write(JSON.stringify({ ok: true, to: npub, uuid, queued: true, note: 'serve may not be running' }) + '\n');
+}
+
+// ── help ──
+
+function doHelp() {
+    process.stdout.write(JSON.stringify({
+        commands: ['login [--nsec <key>]', 'logout', 'serve', 'poll', 'send <npub> <body>', 'whoami', 'help'],
+    }) + '\n');
+}
+
+// ── serve: relay subscription + outbox watcher ──
+
+async function doServe() {
+    const env = loadEnv();
+    if (!env.nsec) err('not-logged-in');
+    let sk;
+    try { sk = decodeNsec(env.nsec); }
+    catch { err('nsec-decode-failed'); }
+    const myHex = getPublicKey(sk);
+    const allowSet = allowedSet(env.allowedNpubs);
+
+    if (!existsSync(spoolDir)) mkdirSync(spoolDir, { recursive: true, mode: 0o700 });
+    if (!existsSync(outboxDir)) mkdirSync(outboxDir, { recursive: true, mode: 0o700 });
+
+    // PID file for liveness check by ensure_nostr_serve()
+    if (pidFile) {
+        writeFileSync(pidFile, String(process.pid), { mode: 0o600 });
+        chmodSync(pidFile, 0o600);
+    }
+
+    const cleanup = () => {
+        if (pidFile && existsSync(pidFile)) { try { unlinkSync(pidFile); } catch {} }
+        process.exit(0);
+    };
+    process.on('SIGTERM', cleanup);
+    process.on('SIGINT', cleanup);
+
+    // Open relay sockets with reconnect/backoff per relay.
+    const sockets = new Map(); // url -> { ws, state, backoff }
+    for (const url of env.relays) openRelay(url, sockets, myHex, sk, allowSet);
+
+    // Outbox watcher: scan now, then watch for new files.
+    const seen = new Set();
+    const drain = async () => {
+        if (!existsSync(outboxDir)) return;
+        for (const f of readdirSync(outboxDir).filter(x => x.endsWith('.jsonl'))) {
+            if (seen.has(f)) continue;
+            seen.add(f);
+            const fpath = join(outboxDir, f);
+            try {
+                const { to_npub, body } = JSON.parse(readFileSync(fpath, 'utf8'));
+                const recipientHex = decodeNpub(to_npub);
+                const wrap = nip17.wrapEvent(sk, { publicKey: recipientHex }, body);
+                const ok = await publishToRelays(wrap, sockets);
+                if (ok) unlinkSync(fpath);
+                // else: leave for retry; remove from seen so it tries again
+                else seen.delete(f);
+            } catch (e) {
+                process.stderr.write(`serve-send-error file=${f} err=${e.message}\n`);
+                seen.delete(f);
+            }
+        }
+    };
+    try {
+        watch(outboxDir, { persistent: true }, () => { drain().catch(() => {}); });
+    } catch { /* fall back to interval polling */ }
+    setInterval(() => { drain().catch(() => {}); }, 250);
+
+    // Stay alive
+    await new Promise(() => {});
+}
+
+function openRelay(url, sockets, myHex, sk, allowSet) {
+    let backoff = 1000;
+    const connect = () => {
+        const ws = new WebSocket(url);
+        sockets.set(url, { ws, state: 'connecting', pending: new Map() });
+        ws.on('open', () => {
+            sockets.get(url).state = 'open';
+            backoff = 1000;
+            // Subscribe to kind:1059 wraps p-tagged to me, last 7 days.
+            const since = Math.floor(Date.now() / 1000) - 7 * 86400;
+            ws.send(JSON.stringify(['REQ', 'fagents-dms', { kinds: [1059], '#p': [myHex], since }]));
+        });
+        ws.on('message', (raw) => {
+            try {
+                const msg = JSON.parse(raw.toString());
+                if (msg[0] === 'EVENT' && msg[1] === 'fagents-dms') {
+                    handleInbound(msg[2], sk, myHex, allowSet);
+                } else if (msg[0] === 'OK' && msg[1]) {
+                    const entry = sockets.get(url)?.pending.get(msg[1]);
+                    if (entry) entry.resolve(msg[2] === true);
+                }
+                // NOTICE / EOSE / CLOSED handled by just continuing
+            } catch { /* malformed relay frame -- ignore */ }
+        });
+        const reopen = () => {
+            sockets.get(url).state = 'closed';
+            setTimeout(connect, backoff);
+            backoff = Math.min(backoff * 2, 60000);
+        };
+        ws.on('close', reopen);
+        ws.on('error', () => { try { ws.close(); } catch {} });
+    };
+    connect();
+}
+
+// Inbound: unwrap + verify per NIP-17/NIP-59, allow-list, write spool.
+function handleInbound(wrap, sk, myHex, allowSet) {
+    try {
+        if (!wrap || wrap.kind !== 1059) return;
+        if (!verifyEvent(wrap)) return reject(wrap, 'wrap-sig-invalid');
+        if (!wrap.tags?.some(t => t[0] === 'p' && t[1] === myHex)) return reject(wrap, 'wrap-not-for-me');
+
+        // Decrypt wrap content -> seal JSON
+        const ck1 = nip44.v2.utils.getConversationKey(sk, wrap.pubkey);
+        let seal;
+        try {
+            seal = JSON.parse(nip44.v2.decrypt(wrap.content, ck1));
+        } catch { return reject(wrap, 'wrap-decrypt-failed'); }
+
+        if (seal.kind !== 13) return reject(wrap, 'seal-wrong-kind');
+        if (!verifyEvent(seal)) return reject(wrap, 'seal-sig-invalid');
+
+        // Decrypt seal content -> rumor JSON
+        const ck2 = nip44.v2.utils.getConversationKey(sk, seal.pubkey);
+        let rumor;
+        try {
+            rumor = JSON.parse(nip44.v2.decrypt(seal.content, ck2));
+        } catch { return reject(wrap, 'seal-decrypt-failed'); }
+
+        if (rumor.kind !== 14) return reject(wrap, 'rumor-wrong-kind');
+        if (!rumor.id) return reject(wrap, 'rumor-missing-id');
+        if (rumor.id !== getEventHash(rumor)) return reject(wrap, 'rumor-id-mismatch');
+        if (rumor.sig) return reject(wrap, 'rumor-must-not-be-signed');
+        if (rumor.pubkey !== seal.pubkey) return reject(wrap, 'seal-rumor-pubkey-mismatch');
+        if (!rumor.tags?.some(t => t[0] === 'p' && t[1] === myHex)) return reject(wrap, 'rumor-not-for-me');
+
+        // Allow-list check (in hex)
+        if (!allowSet.has(rumor.pubkey)) {
+            process.stderr.write(`drop wrap=${wrap.id} reason=sender-not-allowed sender=${rumor.pubkey}\n`);
+            return;
+        }
+
+        // Write spool
+        if (!existsSync(spoolDir)) mkdirSync(spoolDir, { recursive: true, mode: 0o700 });
+        const fpath = join(spoolDir, `${randomUUID()}.jsonl`);
+        const fromNpub = nip19.npubEncode(rumor.pubkey);
+        const record = {
+            ts: new Date(rumor.created_at * 1000).toISOString(),
+            from_npub: fromNpub,
+            from_hex: rumor.pubkey,
+            body: rumor.content,
+            wrap_event_id: wrap.id,
+            rumor_id: rumor.id,
+        };
+        writeFileSync(fpath, JSON.stringify(record), { mode: 0o600 });
+        chmodSync(fpath, 0o600);
+    } catch (e) {
+        process.stderr.write(`handleInbound exception err=${e.message}\n`);
+    }
+}
+
+function reject(wrap, reason) {
+    process.stderr.write(`drop wrap=${wrap?.id || '?'} reason=${reason}\n`);
+}
+
+// Publish a signed event to all open relays. Resolve true if any relay OKs within 5s.
+async function publishToRelays(event, sockets) {
+    const frame = JSON.stringify(['EVENT', event]);
+    let resolveAll;
+    const done = new Promise(r => { resolveAll = r; });
+    let outstanding = 0;
+    let anyOk = false;
+    let resolved = false;
+
+    const settle = () => {
+        if (resolved) return;
+        if (outstanding === 0 || anyOk) {
+            resolved = true;
+            resolveAll(anyOk);
+        }
+    };
+
+    for (const [, sock] of sockets) {
+        if (sock.state !== 'open' || sock.ws.readyState !== 1) continue;
+        outstanding++;
+        const promise = new Promise((res) => {
+            sock.pending.set(event.id, { resolve: (ok) => { sock.pending.delete(event.id); res(ok); } });
+            try { sock.ws.send(frame); } catch { res(false); }
+        });
+        promise.then((ok) => {
+            outstanding--;
+            if (ok) anyOk = true;
+            settle();
+        });
+    }
+    if (outstanding === 0) return false;
+
+    const timeout = sleep(5000).then(() => { resolved || (resolved = true, resolveAll(anyOk)); });
+    return Promise.race([done, timeout.then(() => anyOk)]);
+}
