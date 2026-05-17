@@ -439,6 +439,189 @@ serveProc2.kill('SIGTERM');
 await sleep(200);
 relay.close();
 
+// ── 36-41: bug-fix regression tests ──
+//   36: dedup of same valid wrap.id (no spam spool)
+//   37: dedup poison guard (invalid sig with same id does not block valid arrival)
+//   38: CLOSED triggers exponential reconnect backoff (no 1s loop)
+//   39: kind:10050 inbox-relay list published on socket open
+//   40: kind:10050 published on late-arriving relay (reconnect path)
+
+console.log('\nServe regression tests:');
+
+// ── 36 + 37 + 39: spawn a fresh serve against a fresh mock relay ──
+
+const portB = 36000 + Math.floor(Math.random() * 100);
+const relayB = await mockRelay(portB);
+const skSenderB = generateSecretKey();
+const pkSenderB = getPublicKey(skSenderB);
+const npubSenderB = nip19.npubEncode(pkSenderB);
+const skRecvB = generateSecretKey();
+const pkRecvB = getPublicKey(skRecvB);
+const nsecRecvB = nip19.nsecEncode(skRecvB);
+const npubRecvB = nip19.npubEncode(pkRecvB);
+
+writeFileSync(envFile, [
+    `NOSTR_NSEC=${nsecRecvB}`,
+    `NOSTR_NPUB=${npubRecvB}`,
+    `NOSTR_RELAYS=ws://127.0.0.1:${portB}`,
+    `NOSTR_ALLOWED_NPUBS=${npubSenderB}`,
+    '',
+].join('\n'));
+chmodSync(envFile, 0o600);
+clearDir(spoolDir);
+clearDir(outboxDir);
+const serveProcB = spawn('node', [CLI, ...baseFlags, 'serve'], { stdio: ['ignore', 'pipe', 'pipe'] });
+await sleep(800);
+
+// 36: dedup of same valid wrap.id
+clearDir(spoolDir);
+const dupWrap = nip17.wrapEvent(skSenderB, { publicKey: pkRecvB }, 'dup-test');
+relayB.push(dupWrap);
+await sleep(300);
+relayB.push(dupWrap);  // exact same event id
+await sleep(300);
+assertEq(1, readdirSync(spoolDir).length, '36: same valid wrap.id spooled exactly once');
+
+// 37: dedup poison guard -- invalid sig with same id must NOT block valid arrival
+clearDir(spoolDir);
+const realWrapC = nip17.wrapEvent(skSenderB, { publicKey: pkRecvB }, 'poison-test-payload');
+// Build a poisoned copy: same id (sig is not in the hash) but junk sig
+const poisonedWrap = { ...realWrapC, sig: '0'.repeat(128) };
+relayB.push(poisonedWrap);  // serve should fail verifyEvent, NOT mark id seen
+await sleep(300);
+assertEq(0, readdirSync(spoolDir).length, '37a: poisoned wrap (bad sig) rejected, no spool');
+relayB.push(realWrapC);     // real one with same id
+await sleep(500);
+assertEq(1, readdirSync(spoolDir).length, '37b: real wrap with same id still spooled (cache not poisoned)');
+
+// 39: kind:10050 inbox-relay list event published on socket open
+const inboxEvents = relayB.recv.filter(e => e?.kind === 10050);
+assertTrue(inboxEvents.length >= 1, '39a: kind:10050 inbox-relay list published');
+if (inboxEvents.length >= 1) {
+    const ev = inboxEvents[0];
+    const relayTags = (ev.tags || []).filter(t => t[0] === 'relay').map(t => t[1]);
+    assertEq(1, relayTags.length, '39b: kind:10050 has 1 relay tag');
+    assertEq(`ws://127.0.0.1:${portB}`, relayTags[0], '39c: kind:10050 relay tag matches env.relays[0]');
+}
+
+serveProcB.kill('SIGTERM');
+await sleep(200);
+relayB.close();
+
+// ── 38: CLOSED triggers exponential reconnect backoff ──
+
+// HOSTILE_REASON contains newline + CR + tab. truncate() in nostr.mjs must
+// sanitize control chars so a hostile relay can't forge multi-line log
+// entries in journald.
+const HOSTILE_REASON = 'rate-limited\nINJECTED\rsecond-line\tWITH-TAB';
+
+async function closedMockRelay(port) {
+    const wss = new WebSocketServer({ port });
+    const events = [];  // {ts, type: 'connect' | 'req' | 'close'}
+    wss.on('connection', (ws) => {
+        events.push({ ts: Date.now(), type: 'connect' });
+        ws.on('message', (raw) => {
+            try {
+                const msg = JSON.parse(raw.toString());
+                if (msg[0] === 'REQ') {
+                    events.push({ ts: Date.now(), type: 'req' });
+                    ws.send(JSON.stringify(['CLOSED', msg[1], HOSTILE_REASON]));
+                } else if (msg[0] === 'EVENT') {
+                    events.push({ ts: Date.now(), type: 'event' });
+                    // Don't OK; relay is hostile in this test
+                }
+            } catch {}
+        });
+        ws.on('close', () => events.push({ ts: Date.now(), type: 'close' }));
+    });
+    return {
+        port,
+        events,
+        close: () => wss.close(),
+    };
+}
+
+const portC = 36100 + Math.floor(Math.random() * 100);
+const closedRelay = await closedMockRelay(portC);
+
+writeFileSync(envFile, [
+    `NOSTR_NSEC=${nsecRecvB}`,
+    `NOSTR_NPUB=${npubRecvB}`,
+    `NOSTR_RELAYS=ws://127.0.0.1:${portC}`,
+    `NOSTR_ALLOWED_NPUBS=${npubSenderB}`,
+    '',
+].join('\n'));
+chmodSync(envFile, 0o600);
+const serveProcC = spawn('node', [CLI, ...baseFlags, 'serve'], { stdio: ['ignore', 'pipe', 'pipe'] });
+let stderrC = '';
+serveProcC.stderr.on('data', (chunk) => { stderrC += chunk.toString(); });
+
+// Wait long enough to see at least 3 connects with growing delays.
+// Schedule: connect at ~0, reconnect at ~1s, reconnect at ~3s (1+2), reconnect at ~7s (1+2+4).
+// We wait 5s to get at least 3 connects (0, 1s, 3s).
+await sleep(5000);
+
+const connects = closedRelay.events.filter(e => e.type === 'connect');
+assertTrue(connects.length >= 3,
+    `38a: at least 3 connect attempts under persistent CLOSED (got ${connects.length})`);
+if (connects.length >= 3) {
+    const delay1 = connects[1].ts - connects[0].ts;
+    const delay2 = connects[2].ts - connects[1].ts;
+    // First reconnect ~1s, second ~2s (exponential). Allow generous slack.
+    assertTrue(delay2 > delay1,
+        `38b: second reconnect delay (${delay2}ms) > first (${delay1}ms) -- exponential backoff`);
+    assertTrue(delay1 >= 800,
+        `38c: first reconnect waited ~1s (got ${delay1}ms)`);
+}
+const reqs = closedRelay.events.filter(e => e.type === 'req');
+assertEq(connects.length, reqs.length,
+    '38d: one REQ per connection (no rapid re-REQ on same socket)');
+
+// 38e: hostile multiline CLOSED reason is sanitized to one log line per CLOSED.
+// truncate() must strip newlines/CR/tabs from relay-controlled strings so a
+// hostile relay can't inject fake log entries into journald.
+const closedLogs = stderrC.split('\n').filter(l => l.includes('relay-closed-sub'));
+assertEq(reqs.length, closedLogs.length,
+    `38e: one relay-closed-sub log per CLOSED frame (got ${closedLogs.length}, expected ${reqs.length}) -- no newline injection`);
+// 38f: the injected substring 'INJECTED' must not appear on a line by itself
+// (would mean a newline survived sanitization). Confirm 'INJECTED' is on the
+// same log line as 'relay-closed-sub'.
+const orphanInjected = stderrC.split('\n').some(l =>
+    l.trim().startsWith('INJECTED') || l.trim().startsWith('second-line') || l.trim().startsWith('WITH-TAB'));
+assertTrue(!orphanInjected,
+    '38f: no orphan injected line in stderr (control chars stripped by truncate)');
+
+serveProcC.kill('SIGTERM');
+await sleep(200);
+closedRelay.close();
+
+// ── 40: kind:10050 published on late-arriving relay (reconnect path) ──
+
+const portD = 36200 + Math.floor(Math.random() * 100);
+writeFileSync(envFile, [
+    `NOSTR_NSEC=${nsecRecvB}`,
+    `NOSTR_NPUB=${npubRecvB}`,
+    `NOSTR_RELAYS=ws://127.0.0.1:${portD}`,
+    `NOSTR_ALLOWED_NPUBS=${npubSenderB}`,
+    '',
+].join('\n'));
+chmodSync(envFile, 0o600);
+// Start serve BEFORE relay -- first connection attempt should fail with ECONNREFUSED
+const serveProcD = spawn('node', [CLI, ...baseFlags, 'serve'], { stdio: ['ignore', 'pipe', 'pipe'] });
+await sleep(1500);  // serve has tried, failed, scheduled reconnect
+
+// Start the relay AFTER serve has already tried to connect once
+const relayD = await mockRelay(portD);
+await sleep(3500);  // give serve time to reconnect (backoff was at 2s) + publish
+
+const inboxEventsD = relayD.recv.filter(e => e?.kind === 10050);
+assertTrue(inboxEventsD.length >= 1,
+    `40: kind:10050 eventually published once late-arriving relay accepts conn (got ${inboxEventsD.length})`);
+
+serveProcD.kill('SIGTERM');
+await sleep(200);
+relayD.close();
+
 // ── Summary ──
 
 console.log('');

@@ -60,6 +60,19 @@ function err(msg) {
     process.exit(1);
 }
 
+// Sanitize relay-controlled log strings. A misbehaving or hostile relay can
+// send a NOTICE / CLOSED reason / error message containing newlines, carriage
+// returns, or other control chars; without normalization those would inject
+// fake log lines into journald. Replace runs of C0/DEL with a single space,
+// then cap length to bound journald cost.
+// Function declaration (hoisted) so it's available while doServe runs --
+// doServe is awaited from the dispatch switch, which leaves any `const`
+// declared further down in the temporal dead zone for serve's lifetime.
+function truncate(s, max = 200) {
+    const str = (s == null ? '?' : String(s)).replace(/[\x00-\x1F\x7F]+/g, ' ');
+    return str.length > max ? str.slice(0, max) + '...' : str;
+}
+
 // ── Arg parsing ──
 
 const args = process.argv.slice(2);
@@ -302,9 +315,31 @@ async function doServe() {
     process.on('SIGTERM', cleanup);
     process.on('SIGINT', cleanup);
 
-    // Open relay sockets with reconnect/backoff per relay.
-    const sockets = new Map(); // url -> { ws, state, backoff }
-    for (const url of env.relays) openRelay(url, sockets, myHex, sk, allowSet);
+    // Dedup of wrap event ids, bounded FIFO to 10k. Poison-resistance
+    // (only-add-after-spool-write) is enforced in handleInbound.
+    const seenWrapIds = new Set();
+    const markSeen = (id) => {
+        seenWrapIds.add(id);
+        if (seenWrapIds.size > 10000) {
+            seenWrapIds.delete(seenWrapIds.values().next().value);
+        }
+    };
+
+    // NIP-17 section 6 kind:10050 inbox-relay list, built and serialized once.
+    // Sent on every socket open (incl. reconnects); relays handle
+    // replaceable-event dedup.
+    const inboxListEvent = finalizeEvent({
+        kind: 10050,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: env.relays.map(r => ['relay', r]),
+        content: '',
+    }, sk);
+    const inboxListFrame = JSON.stringify(['EVENT', inboxListEvent]);
+
+    const sockets = new Map(); // url -> { ws, state, pending }
+    for (const url of env.relays) {
+        openRelay(url, sockets, myHex, sk, allowSet, seenWrapIds, markSeen, inboxListEvent, inboxListFrame);
+    }
 
     // Outbox watcher: scan now, then watch for new files.
     const seen = new Set();
@@ -337,45 +372,131 @@ async function doServe() {
     await new Promise(() => {});
 }
 
-function openRelay(url, sockets, myHex, sk, allowSet) {
+function openRelay(url, sockets, myHex, sk, allowSet, seenWrapIds, markSeen, inboxListEvent, inboxListFrame) {
+    // Reconnect backoff. Reset only when subscription is healthy (EOSE
+    // received, OR 30s of stability post-open). The relay opening the
+    // WebSocket is not the same as the relay accepting our subscription;
+    // a persistent CLOSED (auth-required, rate-limited, blocked, ...) must
+    // back off exponentially or we spin in a 1s reconnect loop.
     let backoff = 1000;
+    let stableTimer = null;
+    let pingTimer = null;
+    let lastPongAt = 0;
+
+    const clearStable = () => {
+        if (stableTimer) { clearTimeout(stableTimer); stableTimer = null; }
+    };
+    const clearPing = () => {
+        if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+    };
+
     const connect = () => {
         const ws = new WebSocket(url);
         sockets.set(url, { ws, state: 'connecting', pending: new Map() });
+
         ws.on('open', () => {
             sockets.get(url).state = 'open';
-            backoff = 1000;
+            // NOTE: do NOT reset backoff here. Wait for EOSE or 30s stability.
+
             // Subscribe to kind:1059 wraps p-tagged to me, last 7 days.
             const since = Math.floor(Date.now() / 1000) - 7 * 86400;
-            ws.send(JSON.stringify(['REQ', 'fagents-dms', { kinds: [1059], '#p': [myHex], since }]));
+            try {
+                ws.send(JSON.stringify(['REQ', 'fagents-dms', { kinds: [1059], '#p': [myHex], since }]));
+                process.stderr.write(`subscribed url=${url}\n`);
+            } catch (e) {
+                process.stderr.write(`subscribe-failed url=${url} err=${truncate(e.message)}\n`);
+            }
+
+            // Publish NIP-17 inbox-relay list (kind:10050). Fire-and-forget;
+            // OK frame logs success. inboxListFrame is precomputed at startup.
+            try {
+                ws.send(inboxListFrame);
+                process.stderr.write(`inbox-list-publish-attempt url=${url}\n`);
+            } catch (e) {
+                process.stderr.write(`inbox-list-publish-failed url=${url} err=${truncate(e.message)}\n`);
+            }
+
+            // Reset backoff after 30s of stability (no CLOSED). EOSE will
+            // reset it sooner if the relay sends one (which it should per
+            // NIP-01, even on empty results).
+            clearStable();
+            stableTimer = setTimeout(() => {
+                backoff = 1000;
+                stableTimer = null;
+            }, 30000);
+
+            // Keepalive: ping every 30s. If no pong for 90s, force-close to
+            // trigger reconnect (handles half-open conns that don't fire
+            // 'close' on their own).
+            lastPongAt = Date.now();
+            clearPing();
+            pingTimer = setInterval(() => {
+                if (Date.now() - lastPongAt > 90000) {
+                    process.stderr.write(`relay-stale-pong url=${url}\n`);
+                    try { ws.terminate(); } catch {}
+                    return;
+                }
+                try { ws.ping(); } catch {}
+            }, 30000);
         });
+
+        ws.on('pong', () => { lastPongAt = Date.now(); });
+
         ws.on('message', (raw) => {
             try {
                 const msg = JSON.parse(raw.toString());
                 if (msg[0] === 'EVENT' && msg[1] === 'fagents-dms') {
-                    handleInbound(msg[2], sk, myHex, allowSet);
+                    handleInbound(msg[2], sk, myHex, allowSet, seenWrapIds, markSeen);
                 } else if (msg[0] === 'OK' && msg[1]) {
+                    if (msg[1] === inboxListEvent.id && msg[2] === true) {
+                        process.stderr.write(`inbox-list-published url=${url}\n`);
+                    }
                     const entry = sockets.get(url)?.pending.get(msg[1]);
                     if (entry) entry.resolve(msg[2] === true);
+                } else if (msg[0] === 'EOSE' && msg[1] === 'fagents-dms') {
+                    // Sub accepted, now in live mode. Safe to reset backoff.
+                    backoff = 1000;
+                    clearStable();
+                    process.stderr.write(`relay-eose url=${url}\n`);
+                } else if (msg[0] === 'CLOSED' && msg[1] === 'fagents-dms') {
+                    process.stderr.write(`relay-closed-sub url=${url} reason=${truncate(msg[2])}\n`);
+                    clearStable();
+                    // Force-close. ws.on('close') -> reopen() with the
+                    // current (un-reset) backoff so persistent CLOSED gets
+                    // real exponential spacing.
+                    try { ws.terminate(); } catch {}
+                } else if (msg[0] === 'NOTICE') {
+                    process.stderr.write(`relay-notice url=${url} msg=${truncate(msg[1])}\n`);
                 }
-                // NOTICE / EOSE / CLOSED handled by just continuing
             } catch { /* malformed relay frame -- ignore */ }
         });
+
         const reopen = () => {
-            sockets.get(url).state = 'closed';
+            clearStable();
+            clearPing();
+            const entry = sockets.get(url);
+            if (entry) entry.state = 'closed';
             setTimeout(connect, backoff);
             backoff = Math.min(backoff * 2, 60000);
         };
         ws.on('close', reopen);
-        ws.on('error', () => { try { ws.close(); } catch {} });
+        ws.on('error', (e) => {
+            process.stderr.write(`relay-error url=${url} err=${truncate(e?.message)}\n`);
+            try { ws.close(); } catch {}
+        });
     };
     connect();
 }
 
 // Inbound: unwrap + verify per NIP-17/NIP-59, allow-list, write spool.
-function handleInbound(wrap, sk, myHex, allowSet) {
+function handleInbound(wrap, sk, myHex, allowSet, seenWrapIds, markSeen) {
     try {
         if (!wrap || wrap.kind !== 1059) return;
+        // Cheap dedup check BEFORE expensive crypto. Only valid spool-written
+        // wraps are in this set (markSeen runs only after successful write),
+        // so an invalid frame with the same id as a future valid event can
+        // never poison the cache.
+        if (seenWrapIds.has(wrap.id)) return;
         if (!verifyEvent(wrap)) return reject(wrap, 'wrap-sig-invalid');
         if (!wrap.tags?.some(t => t[0] === 'p' && t[1] === myHex)) return reject(wrap, 'wrap-not-for-me');
 
@@ -423,6 +544,10 @@ function handleInbound(wrap, sk, myHex, allowSet) {
         };
         writeFileSync(fpath, JSON.stringify(record), { mode: 0o600 });
         chmodSync(fpath, 0o600);
+
+        // Mark seen ONLY after successful spool write. Invalid frames that
+        // hit any earlier `return reject(...)` never enter the dedup cache.
+        markSeen(wrap.id);
     } catch (e) {
         process.stderr.write(`handleInbound exception err=${e.message}\n`);
     }
