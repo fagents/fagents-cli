@@ -622,6 +622,331 @@ serveProcD.kill('SIGTERM');
 await sleep(200);
 relayD.close();
 
+// ── 41-55: nostr.mjs search ──
+//   41: hashtag mode (NIP-01 #t filter) returns signed events
+//   42: keyword mode (NIP-50 search filter) returns signed events
+//   43: interspersed flag parsing -- keyword before --since works
+//   44: dedup across relays
+//   45: verifyEvent rejects bad-sig events
+//   46: content sanitization strips smuggling Unicode
+//   47: tag sanitization strips smuggling Unicode (P1 regression)
+//   48: timeout returns within budget when relay never sends EOSE
+//   49: mutually exclusive flags
+//   50: empty input
+//   51: flag validation (bad-kind, bad-limit, bad-since, bad-author)
+//   52: NOSTR_SEARCH_RELAYS precedence over NOSTR_RELAYS
+
+console.log('\nSearch:');
+
+// Search-mode mock relay: drives EVENT/EOSE in response to REQ. Records
+// the received filter for assertion. If `withhold` is true, never sends
+// EOSE (drives the timeout path).
+async function searchMockRelay(port, eventsToReturn, { withhold = false } = {}) {
+    const wss = new WebSocketServer({ port });
+    const recvFilters = [];
+    let lastSubId = null;
+    wss.on('connection', (ws) => {
+        ws.on('message', (raw) => {
+            let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
+            if (msg[0] === 'REQ') {
+                lastSubId = msg[1];
+                recvFilters.push(msg[2]);
+                for (const ev of eventsToReturn) {
+                    try { ws.send(JSON.stringify(['EVENT', lastSubId, ev])); } catch {}
+                }
+                if (!withhold) {
+                    try { ws.send(JSON.stringify(['EOSE', lastSubId])); } catch {}
+                }
+            } else if (msg[0] === 'CLOSE') {
+                /* client tore down sub -- nothing to do */
+            }
+        });
+    });
+    return { port, recvFilters, close: () => wss.close() };
+}
+
+function signNote(sk, content, tags = []) {
+    return finalizeEvent({
+        kind: 1,
+        created_at: Math.floor(Date.now() / 1000),
+        content,
+        tags,
+    }, sk);
+}
+
+// Async variant of run() -- needed because search tests run a WebSocketServer
+// in this process. execFileSync would block the event loop and the mock
+// relay's `connection` handler would never fire while the subprocess waits.
+//
+// Test isolation: NOSTR_SEARCH_RELAYS is explicitly cleared by default
+// (codex r3 P2). loadEnv() gives process env precedence over env-file, so
+// a stray dev shell var would silently route mock-relay tests to an
+// external relay. Tests that exercise process-env precedence opt in by
+// passing { NOSTR_SEARCH_RELAYS: '...' } in the env arg.
+function runSearch(args, env = {}) {
+    return new Promise((resolve) => {
+        const childEnv = { ...process.env, NOSTR_SEARCH_TIMEOUT_MS: '2000' };
+        delete childEnv.NOSTR_SEARCH_RELAYS;
+        Object.assign(childEnv, env);
+        const proc = spawn('node', [CLI, ...baseFlags, 'search', ...args], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            env: childEnv,
+        });
+        let stdout = '', stderr = '';
+        proc.stdout.on('data', (d) => { stdout += d.toString(); });
+        proc.stderr.on('data', (d) => { stderr += d.toString(); });
+        proc.on('close', (code) => {
+            resolve({ stdout: stdout.trim(), stderr: stderr.trim(), status: code || 0 });
+        });
+    });
+}
+
+const skNoter = generateSecretKey();
+const pkNoter = getPublicKey(skNoter);
+
+// 41: hashtag mode
+{
+    const port = 36600 + Math.floor(Math.random() * 100);
+    const ev1 = signNote(skNoter, 'first note', [['t', 'bitcoin']]);
+    const ev2 = signNote(skNoter, 'second note', [['t', 'bitcoin']]);
+    const r = await searchMockRelay(port, [ev1, ev2]);
+    writeEnv([`NOSTR_RELAYS=ws://127.0.0.1:${port}`, ''].join('\n'));
+
+    const res = await runSearch(['--tag', 'bitcoin', '--limit', '5']);
+    assertEq(0, res.status, '41a: hashtag search exits 0');
+    const lines = res.stdout.split('\n').filter(Boolean);
+    assertEq(2, lines.length, '41b: 2 events returned');
+    const seenFilter = r.recvFilters[0];
+    assertEq('bitcoin', seenFilter?.['#t']?.[0], '41c: relay received #t=bitcoin');
+    r.close();
+}
+
+// 42: keyword mode (NIP-50)
+{
+    const port = 36700 + Math.floor(Math.random() * 100);
+    const ev = signNote(skNoter, 'lightning is fast', []);
+    const r = await searchMockRelay(port, [ev]);
+    writeEnv([`NOSTR_RELAYS=ws://127.0.0.1:${port}`, ''].join('\n'));
+
+    const res = await runSearch(['lightning']);
+    assertEq(0, res.status, '42a: keyword search exits 0');
+    const parsed = JSON.parse(res.stdout.split('\n')[0]);
+    assertEq('lightning is fast', parsed.content, '42b: content matches');
+    assertEq('lightning', r.recvFilters[0]?.search, '42c: relay received search=lightning');
+    r.close();
+}
+
+// 43: interspersed flags -- keyword first, --since after
+{
+    const port = 36800 + Math.floor(Math.random() * 100);
+    const r = await searchMockRelay(port, []);
+    writeEnv([`NOSTR_RELAYS=ws://127.0.0.1:${port}`, ''].join('\n'));
+
+    await runSearch(['"lightning network"', '--since', '24h']);
+    const f = r.recvFilters[0];
+    assertTrue(f?.search?.includes('lightning network'), '43a: keyword passed through interspersed flag');
+    assertTrue(typeof f?.since === 'number', '43b: --since after keyword applied');
+    r.close();
+}
+
+// 44: dedup across relays
+{
+    const portA = 36900 + Math.floor(Math.random() * 50);
+    const portB = 36950 + Math.floor(Math.random() * 50);
+    const ev = signNote(skNoter, 'dup', [['t', 'dup']]);
+    const a = await searchMockRelay(portA, [ev]);
+    const b = await searchMockRelay(portB, [ev]);
+    writeEnv([`NOSTR_RELAYS=ws://127.0.0.1:${portA},ws://127.0.0.1:${portB}`, ''].join('\n'));
+
+    const res = await runSearch(['--tag', 'dup']);
+    const lines = res.stdout.split('\n').filter(Boolean);
+    assertEq(1, lines.length, '44: same event from 2 relays dedups to 1 output line');
+    a.close(); b.close();
+}
+
+// 45: verifyEvent rejects bad sig
+{
+    const port = 37000 + Math.floor(Math.random() * 100);
+    const good = signNote(skNoter, 'good event', [['t', 'check']]);
+    const bad = { ...good, id: 'aa'.repeat(32), sig: '00'.repeat(64) };
+    const r = await searchMockRelay(port, [good, bad]);
+    writeEnv([`NOSTR_RELAYS=ws://127.0.0.1:${port}`, ''].join('\n'));
+
+    const res = await runSearch(['--tag', 'check']);
+    const lines = res.stdout.split('\n').filter(Boolean);
+    assertEq(1, lines.length, '45: bad-sig event rejected by verifyEvent');
+    r.close();
+}
+
+// 46: content sanitization
+{
+    const port = 37100 + Math.floor(Math.random() * 100);
+    const ev = signNote(skNoter, 'Hello X\u{E0065}\u{E0076}\u{E0069}\u{E006C} World', [['t', 'sani']]);
+    const r = await searchMockRelay(port, [ev]);
+    writeEnv([`NOSTR_RELAYS=ws://127.0.0.1:${port}`, ''].join('\n'));
+
+    const res = await runSearch(['--tag', 'sani']);
+    const parsed = JSON.parse(res.stdout);
+    assertEq('Hello X World', parsed.content, '46: smuggled tag-block payload stripped from content');
+    r.close();
+}
+
+// 47: tag sanitization (P1 regression)
+{
+    const port = 37200 + Math.floor(Math.random() * 100);
+    const ev = signNote(skNoter, 'tag sanitize test', [
+        ['t', 'tagsani'],
+        ['client', 'amethyst\u{200B}\u{E0065}\u{E0076}\u{E0069}\u{E006C}'],
+    ]);
+    const r = await searchMockRelay(port, [ev]);
+    writeEnv([`NOSTR_RELAYS=ws://127.0.0.1:${port}`, ''].join('\n'));
+
+    const res = await runSearch(['--tag', 'tagsani']);
+    const parsed = JSON.parse(res.stdout);
+    const clientTag = parsed.tags.find(t => t[0] === 'client');
+    assertEq('amethyst', clientTag?.[1], '47: smuggled payload stripped from tag value');
+    r.close();
+}
+
+// 48: timeout when relay never sends EOSE
+{
+    const port = 37300 + Math.floor(Math.random() * 100);
+    const r = await searchMockRelay(port, [], { withhold: true });
+    writeEnv([`NOSTR_RELAYS=ws://127.0.0.1:${port}`, ''].join('\n'));
+
+    const t0 = Date.now();
+    const res = await runSearch(['--tag', 'timeout'], { NOSTR_SEARCH_TIMEOUT_MS: '300' });
+    const elapsed = Date.now() - t0;
+    assertEq(0, res.status, '48a: timeout still exits 0');
+    assertTrue(elapsed < 2000, `48b: returned within budget (got ${elapsed}ms)`);
+    r.close();
+}
+
+// 49: mutually exclusive flags
+{
+    writeEnv('NOSTR_RELAYS=ws://127.0.0.1:39999\n');  // unreachable, won't be queried
+    const res = await runSearch(['--tag', 'x', 'somekeyword']);
+    assertEq(1, res.status, '49a: --tag + keyword exits 1');
+    assertJsonField(res.stdout, 'error', 'use-tag-or-keyword-not-both', '49b: error code matches');
+}
+
+// 50: empty input
+{
+    const res = await runSearch([]);
+    assertEq(1, res.status, '50a: bare search exits 1');
+    assertContains(res.stdout, 'usage:', '50b: error mentions usage');
+}
+
+// 51: flag validation
+{
+    writeEnv('NOSTR_RELAYS=ws://127.0.0.1:39999\n');
+    const tests = [
+        { args: ['--kind', 'abc', 'kw'],        code: 'bad-kind' },
+        { args: ['--kind', '-1', 'kw'],         code: 'bad-kind' },  // codex r2 P2
+        { args: ['--limit', '0', 'kw'],         code: 'bad-limit' },
+        { args: ['--limit', '200', 'kw'],       code: 'bad-limit' },
+        { args: ['--since', 'foo', 'kw'],       code: 'bad-since' },
+        { args: ['--author', 'not_npub', 'kw'], code: 'bad-author-npub' },
+        { args: ['--tag'],                       code: 'bad-tag' },    // simplify: --tag missing value
+        { args: ['--tag', '--limit', '10'],      code: 'bad-tag' },    // simplify: --tag followed by flag, not value
+    ];
+    for (const t of tests) {
+        const res = await runSearch(t.args);
+        assertJsonField(res.stdout, 'error', t.code, `51 [${t.code}]: ${t.args.join(' ')}`);
+    }
+}
+
+// 53: NOTICE is non-fatal (codex r2 P2). Relay sends NOTICE, then EVENT,
+//     then EOSE. The EVENT must still be emitted.
+{
+    const port = 37700 + Math.floor(Math.random() * 100);
+    const ev = signNote(skNoter, 'survived NOTICE', [['t', 'notice']]);
+    const wss = new WebSocketServer({ port });
+    wss.on('connection', (ws) => {
+        ws.on('message', (raw) => {
+            const msg = JSON.parse(raw.toString());
+            if (msg[0] === 'REQ') {
+                ws.send(JSON.stringify(['NOTICE', 'just a chatty relay, please ignore']));
+                ws.send(JSON.stringify(['EVENT', msg[1], ev]));
+                ws.send(JSON.stringify(['EOSE', msg[1]]));
+            }
+        });
+    });
+    writeEnv([`NOSTR_RELAYS=ws://127.0.0.1:${port}`, ''].join('\n'));
+    const res = await runSearch(['--tag', 'notice']);
+    const lines = res.stdout.split('\n').filter(Boolean);
+    assertEq(1, lines.length, '53a: NOTICE before EVENT does not cut off the sub');
+    assertContains(res.stderr || '', 'relay-notice', '53b: NOTICE still logged to stderr');
+    wss.close();
+}
+
+// 54: Stderr log-injection guard (codex r2 P2). Relay sends CLOSED with
+//     newline + control chars in reason. truncate() must strip them so
+//     stderr stays on one line.
+{
+    const port = 37800 + Math.floor(Math.random() * 100);
+    const wss = new WebSocketServer({ port });
+    wss.on('connection', (ws) => {
+        ws.on('message', (raw) => {
+            const msg = JSON.parse(raw.toString());
+            if (msg[0] === 'REQ') {
+                ws.send(JSON.stringify(['CLOSED', msg[1], 'rate-limited\nINJECTED\rsecond-line\tWITH-TAB']));
+            }
+        });
+    });
+    writeEnv([`NOSTR_RELAYS=ws://127.0.0.1:${port}`, ''].join('\n'));
+    const res = await runSearch(['--tag', 'inj']);
+    const closedLogs = (res.stderr || '').split('\n').filter(l => l.includes('relay-closed'));
+    assertEq(1, closedLogs.length, '54a: exactly one relay-closed log line per CLOSED frame');
+    const orphan = (res.stderr || '').split('\n').some(l =>
+        l.trim().startsWith('INJECTED') || l.trim().startsWith('second-line') || l.trim().startsWith('WITH-TAB'));
+    assertTrue(!orphan, '54b: control chars stripped from CLOSED reason by truncate()');
+    wss.close();
+}
+
+// 52: NOSTR_SEARCH_RELAYS precedence (env-file)
+{
+    const portSearch = 37500 + Math.floor(Math.random() * 100);
+    const portDM = 37600 + Math.floor(Math.random() * 100);
+    const ev = signNote(skNoter, 'search relay routed', [['t', 'route']]);
+    const rSearch = await searchMockRelay(portSearch, [ev]);
+    const rDM = await searchMockRelay(portDM, []);  // should NOT be queried
+    writeEnv([
+        `NOSTR_RELAYS=ws://127.0.0.1:${portDM}`,
+        `NOSTR_SEARCH_RELAYS=ws://127.0.0.1:${portSearch}`,
+        '',
+    ].join('\n'));
+
+    const res = await runSearch(['--tag', 'route']);
+    assertEq(1, res.stdout.split('\n').filter(Boolean).length, '52a: 1 event from search relay');
+    assertEq(1, rSearch.recvFilters.length, '52b: search relay queried');
+    assertEq(0, rDM.recvFilters.length, '52c: DM relay NOT queried');
+    rSearch.close(); rDM.close();
+}
+
+// 55: Process env NOSTR_SEARCH_RELAYS wins over env-file value (codex r3 P2)
+{
+    const portProc = 37900 + Math.floor(Math.random() * 50);
+    const portFile = 37950 + Math.floor(Math.random() * 50);
+    const ev = signNote(skNoter, 'process env wins', [['t', 'envprec']]);
+    const rProc = await searchMockRelay(portProc, [ev]);
+    const rFile = await searchMockRelay(portFile, []);  // should NOT be queried
+    writeEnv([
+        `NOSTR_RELAYS=ws://127.0.0.1:39999`,                       // unused
+        `NOSTR_SEARCH_RELAYS=ws://127.0.0.1:${portFile}`,         // file says use this
+        '',
+    ].join('\n'));
+
+    // Process env explicitly opts in -- runSearch normally clears it.
+    const res = await runSearch(['--tag', 'envprec'], {
+        NOSTR_SEARCH_RELAYS: `ws://127.0.0.1:${portProc}`,
+    });
+    assertEq(1, res.stdout.split('\n').filter(Boolean).length, '55a: 1 event from process-env relay');
+    assertEq(1, rProc.recvFilters.length, '55b: process-env relay queried');
+    assertEq(0, rFile.recvFilters.length, '55c: env-file relay NOT queried (process env wins)');
+    rProc.close(); rFile.close();
+}
+
 // ── Summary ──
 
 console.log('');

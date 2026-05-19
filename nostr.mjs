@@ -130,14 +130,79 @@ function writeEnvMerge(path, updates) {
 
 const DEFAULT_RELAYS = 'wss://relay.damus.io,wss://nos.lol,wss://nostr.wine';
 
+function parseRelayList(s) {
+    if (!s) return undefined;
+    const out = String(s).split(',').map(x => x.trim()).filter(Boolean);
+    return out.length ? out : undefined;
+}
+
 function loadEnv() {
     const env = parseEnv(envFile);
     return {
         nsec: env.NOSTR_NSEC || '',
         npub: env.NOSTR_NPUB || '',
-        relays: (env.NOSTR_RELAYS || DEFAULT_RELAYS).split(',').map(s => s.trim()).filter(Boolean),
-        allowedNpubs: (env.NOSTR_ALLOWED_NPUBS || '').split(',').map(s => s.trim()).filter(Boolean),
+        relays: parseRelayList(env.NOSTR_RELAYS || DEFAULT_RELAYS) || [],
+        // Search-only relay override. Precedence: process.env wins (works
+        // for tests / direct invocation), env-file second (sudo-safe since
+        // sudo strips process env vars), then undefined -> caller falls
+        // back to env.relays.
+        searchRelays: parseRelayList(process.env.NOSTR_SEARCH_RELAYS) || parseRelayList(env.NOSTR_SEARCH_RELAYS),
+        allowedNpubs: parseRelayList(env.NOSTR_ALLOWED_NPUBS) || [],
     };
+}
+
+// ── Sanitization (verbatim copy of fagents-mcp/src/sanitize.ts regex) ──
+// Strips prompt-injection-smuggling Unicode classes from agent-visible
+// public-timeline content. Same regex as the accepted email sanitizer:
+// zero-width / full \p{Bidi_Control} / variation selectors / tag block.
+const DANGEROUS = /[\u{061C}\u{200B}-\u{200F}\u{2060}\u{FEFF}\u{202A}-\u{202E}\u{2066}-\u{2069}\u{FE00}-\u{FE0F}\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/gu;
+
+function sanitizeText(s) {
+    if (s == null) return s;
+    return String(s).replace(DANGEROUS, '');
+}
+
+function sanitizeTags(tags) {
+    if (!Array.isArray(tags)) return tags;
+    return tags.map(t => Array.isArray(t)
+        ? t.map(v => typeof v === 'string' ? sanitizeText(v) : v)
+        : t);
+}
+
+// ── Search arg parsing ──
+
+function parseIntStrict(s, name) {
+    if (typeof s !== 'string' || !/^-?\d+$/.test(s)) err(`bad-${name}`);
+    return parseInt(s, 10);
+}
+
+function parseKind(s) {
+    const n = parseIntStrict(s, 'kind');
+    // Nostr kinds are non-negative per NIP-01 (range 0-65535 in practice).
+    if (n < 0) err('bad-kind');
+    return n;
+}
+
+function parseLimit(s) {
+    const n = parseIntStrict(s, 'limit');
+    if (n < 1 || n > 100) err('bad-limit');
+    return n;
+}
+
+// Returns seconds. Throws via err() on garbage.
+function parseSince(s) {
+    if (typeof s !== 'string' || s.length === 0) err('bad-since');
+    const m = s.match(/^(\d+)([smhd])?$/);
+    if (!m) err('bad-since');
+    const n = parseInt(m[1], 10);
+    const unit = m[2] || 's';
+    const mult = { s: 1, m: 60, h: 3600, d: 86400 }[unit];
+    return n * mult;
+}
+
+function decodeNpubOrErr(s) {
+    try { return decodeNpub(s); }
+    catch { err('bad-author-npub'); }
 }
 
 // ── Validation / encoding helpers ──
@@ -174,6 +239,7 @@ switch (cmd) {
     case 'serve':  await doServe(); break;
     case 'poll':   doPoll(); break;
     case 'send':   await doSend(); break;
+    case 'search': await doSearch(); break;
     case 'whoami': doWhoami(); break;
     case 'help': case '--help': case '-h': default: doHelp(); break;
 }
@@ -280,11 +346,132 @@ async function doSend() {
     process.stdout.write(JSON.stringify({ ok: true, to: npub, uuid, queued: true, note: 'serve may not be running' }) + '\n');
 }
 
+// ── search: query public timeline by hashtag (NIP-01 #t) or keyword (NIP-50) ──
+
+async function doSearch() {
+    let tag = '', author = '';
+    let kind = 1, limit = 20, since = 0;
+    const positional = [];
+    while (args.length) {
+        const a = args.shift();
+        if (a === '--tag') {
+            const v = args.shift();
+            if (!v || v.startsWith('--')) err('bad-tag');
+            tag = v;
+        }
+        else if (a === '--kind')   kind = parseKind(args.shift());
+        else if (a === '--limit')  limit = parseLimit(args.shift());
+        else if (a === '--since')  since = parseSince(args.shift());
+        else if (a === '--author') author = decodeNpubOrErr(args.shift());
+        else if (a.startsWith('--')) err(`unknown-flag-${a.slice(2)}`);
+        else positional.push(a);
+    }
+    const keyword = positional.join(' ').trim();
+    if (!tag && !keyword) err('usage: search [--tag <topic>] [<keyword>]');
+    if (tag && keyword) err('use-tag-or-keyword-not-both');
+
+    const filter = { kinds: [kind], limit };
+    if (since) filter.since = Math.floor(Date.now() / 1000) - since;
+    if (author) filter.authors = [author];
+    if (tag) filter['#t'] = [tag.replace(/^#/, '').toLowerCase()];
+    if (keyword) filter.search = keyword;
+
+    const env = loadEnv();
+    const searchRelays = env.searchRelays || env.relays;
+
+    const timeoutMs = parseInt(process.env.NOSTR_SEARCH_TIMEOUT_MS || '5000', 10);
+    const seen = new Set();
+    const events = [];
+
+    await Promise.all(searchRelays.map(url => queryRelay(url, filter, timeoutMs, (ev) => {
+        // Cheap dedup first -- a popular event seen on N relays would
+        // otherwise re-run verifyEvent N times (schnorr verify ~1ms each).
+        if (seen.has(ev.id)) return;
+        if (!verifyEvent(ev)) return;
+        seen.add(ev.id);
+        events.push(ev);
+    })));
+
+    events.sort((a, b) => b.created_at - a.created_at);
+    for (const ev of events) {
+        process.stdout.write(JSON.stringify({
+            kind: ev.kind,
+            id: ev.id,
+            pubkey: ev.pubkey,
+            npub: nip19.npubEncode(ev.pubkey),
+            created_at: ev.created_at,
+            content: sanitizeText(ev.content),
+            tags: sanitizeTags(ev.tags),
+        }) + '\n');
+    }
+}
+
+// One-shot REQ. Open WS, send REQ, collect EVENTs via onEvent until EOSE
+// or timeout, send CLOSE, resolve. Best-effort: errors and timeouts are
+// swallowed so a single bad relay does not abort the fan-out.
+function queryRelay(url, filter, timeoutMs, onEvent) {
+    return new Promise((resolve) => {
+        let ws;
+        let done = false;
+        const finish = () => {
+            if (done) return;
+            done = true;
+            try { ws && ws.close(); } catch {}
+            resolve();
+        };
+        try { ws = new WebSocket(url); } catch { return resolve(); }
+        const subId = `search-${randomUUID()}`;
+        const timer = setTimeout(finish, timeoutMs);
+        ws.on('open', () => {
+            try { ws.send(JSON.stringify(['REQ', subId, filter])); }
+            catch { clearTimeout(timer); finish(); }
+        });
+        ws.on('message', (raw) => {
+            let msg;
+            try { msg = JSON.parse(raw.toString()); } catch { return; }
+            if (msg[0] === 'EVENT' && msg[1] === subId && msg[2]) {
+                try { onEvent(msg[2]); } catch { /* keep relay-side flow alive */ }
+            } else if (msg[0] === 'EOSE' && msg[1] === subId) {
+                try { ws.send(JSON.stringify(['CLOSE', subId])); } catch {}
+                clearTimeout(timer);
+                finish();
+            } else if (msg[0] === 'CLOSED' && msg[1] === subId) {
+                // Relay rejected THIS sub explicitly (NIP-50 filter
+                // unsupported, auth required, rate-limited, etc). Exit
+                // fast instead of waiting the full timeout. truncate()
+                // strips control chars so the relay can't forge log
+                // lines via newlines in the reason.
+                process.stderr.write(`relay-closed url=${url} reason=${truncate(msg[2])}\n`);
+                clearTimeout(timer);
+                finish();
+            } else if (msg[0] === 'NOTICE') {
+                // NOTICE is not subscription-scoped per NIP-01 -- it can
+                // be a relay greeting or warning unrelated to our REQ.
+                // Log + continue waiting for EVENTs / EOSE. Don't fast-
+                // fail or we'd silently drop legitimate results from
+                // chatty relays.
+                process.stderr.write(`relay-notice url=${url} msg=${truncate(msg[1])}\n`);
+            }
+        });
+        ws.on('error', () => { clearTimeout(timer); finish(); });
+        ws.on('close', () => { clearTimeout(timer); finish(); });
+    });
+}
+
 // ── help ──
 
 function doHelp() {
     process.stdout.write(JSON.stringify({
-        commands: ['login [--nsec <key>]', 'logout', 'serve', 'poll', 'send <npub> <body>', 'whoami', 'help'],
+        commands: [
+            'login [--nsec <key>]',
+            'logout',
+            'serve',
+            'poll',
+            'send <npub> <body>',
+            'search [--tag <topic>] [--kind n] [--limit n] [--since 7d] [--author <npub>] [<keyword>]',
+            'whoami',
+            'help',
+        ],
     }) + '\n');
 }
 
