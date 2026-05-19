@@ -1,7 +1,7 @@
 ---
 name: fagents-deploylog
 description: Check for and deploy infrastructure updates from DEPLOYLOG files. Always asks human before deploying.
-allowed-tools: Bash(sudo git -C */repos/fagents.git *),Bash(sudo git -C */workspace/fagents *)
+allowed-tools: Bash(sudo -Hu fagents git -C */repos/fagents.git *),Bash(sudo -Hu fagents git -C */workspace/fagents *)
 ---
 
 # DEPLOYLOG Check
@@ -25,11 +25,11 @@ The diff between them shows unapplied DEPLOYLOGs. **Never pull the working copy 
 INFRA=__INFRA_HOME__
 
 # 1. Fetch latest from GitHub into bare repo
-sudo git -C $INFRA/repos/fagents.git fetch https://github.com/fagents/fagents.git main:main
+sudo -Hu fagents git -C $INFRA/repos/fagents.git fetch https://github.com/fagents/fagents.git main:main
 
 # 2. Compare: what DEPLOYLOG files were added since last deploy?
-LOCAL=$(sudo git -C $INFRA/workspace/fagents rev-parse HEAD)
-NEW=$(sudo git -C $INFRA/repos/fagents.git diff --name-only --diff-filter=A "$LOCAL..main" -- DEPLOYLOG/ | grep -E '^DEPLOYLOG/[0-9]{4}-')
+LOCAL=$(sudo -Hu fagents git -C $INFRA/workspace/fagents rev-parse HEAD)
+NEW=$(sudo -Hu fagents git -C $INFRA/repos/fagents.git diff --name-only --diff-filter=A "$LOCAL..main" -- DEPLOYLOG/ | grep -E '^DEPLOYLOG/[0-9]{4}-')
 
 # 3. If nothing new, done
 if [ -z "$NEW" ]; then
@@ -41,7 +41,7 @@ fi
 
 1. For each new file, read it from the bare repo:
    ```bash
-   sudo git -C $INFRA/repos/fagents.git show "main:DEPLOYLOG/<filename>"
+   sudo -Hu fagents git -C $INFRA/repos/fagents.git show "main:DEPLOYLOG/<filename>"
    ```
 
 2. Post a summary on comms: what changed, which repos, what the deploy involves.
@@ -56,7 +56,7 @@ fi
 
 2. After all steps succeed, pull the working copy to mark as deployed:
    ```bash
-   sudo git -C $INFRA/workspace/fagents pull --ff-only
+   sudo -Hu fagents git -C $INFRA/workspace/fagents pull --ff-only
    ```
 
 3. Report results on comms.
