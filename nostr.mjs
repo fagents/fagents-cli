@@ -205,6 +205,68 @@ function decodeNpubOrErr(s) {
     catch { err('bad-author-npub'); }
 }
 
+// Returns the lowercase hex string if `s` is a 64-char hex, else null.
+// Used to defend against attacker-shaped tag content from parent events
+// in the reply path -- only validated lowercase hex flows into our own
+// signed kind:1 reply tags.
+function normHexId(s) {
+    if (typeof s !== 'string' || !/^[0-9a-f]{64}$/i.test(s)) return null;
+    return s.toLowerCase();
+}
+
+// Build NIP-10 marker-style reply tags from a resolved parent event.
+// Pure function -- no I/O. Carried tag values are normalised through
+// normHexId so malformed entries are dropped and emitted hex is always
+// lowercase.
+function buildReplyTags(parent, relayHint) {
+    const tags = [];
+    const parentId = normHexId(parent.id);
+    const parentPub = normHexId(parent.pubkey);
+    if (!parentId || !parentPub) {
+        // Should never happen for a verifyEvent-passing parent, but
+        // refuse to emit garbage if it somehow does.
+        return tags;
+    }
+
+    // Look for a root marker in the parent's own e tags.
+    let rootId = null;
+    let rootAuthor = null;
+    for (const t of parent.tags || []) {
+        if (!Array.isArray(t) || t[0] !== 'e' || t[3] !== 'root') continue;
+        const id = normHexId(t[1]);
+        if (!id) continue;
+        rootId = id;
+        const author = normHexId(t[4]);
+        if (author) rootAuthor = author;
+        break;
+    }
+
+    if (rootId) {
+        // Parent is a nested reply -- carry its root forward, mark parent as 'reply'.
+        const rootTag = ['e', rootId, relayHint, 'root'];
+        if (rootAuthor) rootTag.push(rootAuthor);
+        tags.push(rootTag);
+        tags.push(['e', parentId, relayHint, 'reply', parentPub]);
+    } else {
+        // Parent IS the root.
+        tags.push(['e', parentId, relayHint, 'root', parentPub]);
+    }
+
+    // p tag chain: parent author first, then any valid p tags from parent, deduped.
+    const seenP = new Set();
+    tags.push(['p', parentPub]);
+    seenP.add(parentPub);
+    for (const t of parent.tags || []) {
+        if (!Array.isArray(t) || t[0] !== 'p') continue;
+        const pk = normHexId(t[1]);
+        if (!pk || seenP.has(pk)) continue;
+        tags.push(['p', pk]);
+        seenP.add(pk);
+    }
+
+    return tags;
+}
+
 // ── Validation / encoding helpers ──
 
 function decodeNsec(nsec) {
@@ -240,6 +302,7 @@ switch (cmd) {
     case 'poll':   doPoll(); break;
     case 'send':   await doSend(); break;
     case 'search': await doSearch(); break;
+    case 'reply':  await doReply(); break;
     case 'whoami': doWhoami(); break;
     case 'help': case '--help': case '-h': default: doHelp(); break;
 }
@@ -458,6 +521,165 @@ function queryRelay(url, filter, timeoutMs, onEvent) {
     });
 }
 
+// ── reply: publish a kind:1 reply to a parent event ──
+//
+// CLI surface: nostr.mjs reply <parent-event-id> <body...>
+// Auto-resolves the parent via one-shot REQ (verifyEvent + id match +
+// kind:1 enforced), builds NIP-10 marker-style reply tags from the
+// resolved parent, sanitises the body, signs as our nsec, publishes to
+// NOSTR_RELAYS. Returns {ok, id, parent, tags} on at-least-one-OK.
+
+async function doReply() {
+    const parentId = normHexId(args.shift());
+    if (!parentId) err('bad-parent-event-id');
+
+    const body = args.join(' ').trim();
+    if (!body) err('usage: reply <parent-event-id> <body>');
+    if (body.includes('\0')) err('null-byte-in-body');
+
+    const env = loadEnv();
+    if (!env.nsec) err('not-logged-in');
+    let sk;
+    try { sk = decodeNsec(env.nsec); } catch { err('nsec-decode-failed'); }
+
+    // Sanitise outbound BEFORE signing. A body of only smuggling chars
+    // would sign+publish empty content -- refuse rather than emit a
+    // signed empty kind:1.
+    const cleanBody = sanitizeText(body);
+    if (!cleanBody.trim()) err('empty-body-after-sanitize');
+
+    const timeoutMs = parseInt(process.env.NOSTR_REPLY_TIMEOUT_MS || '5000', 10);
+
+    // Resolve the parent. resolveEvent enforces sig + id match + kind:1.
+    const resolved = await resolveEvent(parentId, env.relays, timeoutMs);
+    if (!resolved) err('parent-not-found');
+    const { event: parent, relay: parentRelay } = resolved;
+
+    const tags = buildReplyTags(parent, parentRelay);
+    const ev = finalizeEvent({
+        kind: 1,
+        created_at: Math.floor(Date.now() / 1000),
+        tags,
+        content: cleanBody,
+    }, sk);
+
+    const ok = await publishOneShot(ev, env.relays, timeoutMs);
+    if (!ok) err('publish-failed');
+
+    process.stdout.write(JSON.stringify({
+        ok: true,
+        id: ev.id,
+        parent: parentId,
+        tags,
+    }) + '\n');
+}
+
+// Race ephemeral sockets across `relays`. Calls `perRelay({ ws, url,
+// idx, finish, settleRelay })` for each relay so the caller can wire
+// REQ/EVENT/OK-shaped handlers using the provided controls. raceRelays
+// owns the shared lifecycle: timer, sockets[] array, idempotent
+// resolvedOnce flag, per-relay settlement, and the all-sockets-close on
+// finish that prevents the multi-relay post-success hang (silent peer
+// sockets would otherwise keep the Node process alive after stdout).
+//
+// Resolves with whatever the first finish(val) call passed. If every
+// relay settles without finish(), or the timer fires, resolves with
+// `defaultVal`.
+function raceRelays(relays, timeoutMs, defaultVal, perRelay) {
+    return new Promise((resolve) => {
+        if (!relays.length) return resolve(defaultVal);
+
+        const sockets = [];
+        const relayDone = new Array(relays.length).fill(false);
+        let outstanding = relays.length;
+        let resolvedOnce = false;
+        let timer;
+
+        const finish = (val) => {
+            if (resolvedOnce) return;
+            resolvedOnce = true;
+            clearTimeout(timer);
+            for (const s of sockets) { try { s.close(); } catch {} }
+            resolve(val);
+        };
+
+        const settleRelay = (idx) => {
+            if (relayDone[idx]) return;
+            relayDone[idx] = true;
+            if (--outstanding === 0) finish(defaultVal);
+        };
+
+        timer = setTimeout(() => finish(defaultVal), timeoutMs);
+
+        relays.forEach((url, idx) => {
+            let ws;
+            try { ws = new WebSocket(url); }
+            catch { settleRelay(idx); return; }
+            sockets.push(ws);
+            ws.on('error', () => settleRelay(idx));
+            ws.on('close', () => settleRelay(idx));
+            perRelay({ ws, url, idx, finish, settleRelay });
+        });
+    });
+}
+
+// One-shot REQ for a single event id. First event that passes
+// verifyEvent + id match + kind:1 wins. Returns {event, relay} or null.
+function resolveEvent(id, relays, timeoutMs) {
+    return raceRelays(relays, timeoutMs, null, ({ ws, url, idx, finish, settleRelay }) => {
+        const subId = `resolve-${randomUUID()}`;
+        ws.on('open', () => {
+            try { ws.send(JSON.stringify(['REQ', subId, { ids: [id], limit: 1 }])); }
+            catch { settleRelay(idx); }
+        });
+        ws.on('message', (raw) => {
+            let msg;
+            try { msg = JSON.parse(raw.toString()); } catch { return; }
+            if (msg[0] === 'EVENT' && msg[1] === subId && msg[2]) {
+                const ev = msg[2];
+                // Strict gating: signature valid AND relay-claimed id
+                // matches what we asked for AND kind:1.
+                if (ev.id !== id) return;
+                if (ev.kind !== 1) return;
+                if (!verifyEvent(ev)) return;
+                finish({ event: ev, relay: url });
+            } else if ((msg[0] === 'EOSE' && msg[1] === subId) ||
+                       (msg[0] === 'CLOSED' && msg[1] === subId)) {
+                settleRelay(idx);
+            } else if (msg[0] === 'NOTICE') {
+                process.stderr.write(`relay-notice url=${url} msg=${truncate(msg[1])}\n`);
+            }
+        });
+    });
+}
+
+// One-shot EVENT publish to all relays. Resolves true on first OK true,
+// false on timeout / all-relays-failed. Ephemeral sockets (no reuse of
+// serve's long-running outbox pool).
+function publishOneShot(event, relays, timeoutMs) {
+    const frame = JSON.stringify(['EVENT', event]);
+    return raceRelays(relays, timeoutMs, false, ({ ws, url, idx, finish, settleRelay }) => {
+        ws.on('open', () => {
+            try { ws.send(frame); }
+            catch { settleRelay(idx); }
+        });
+        ws.on('message', (raw) => {
+            let msg;
+            try { msg = JSON.parse(raw.toString()); } catch { return; }
+            if (msg[0] === 'OK' && msg[1] === event.id) {
+                if (msg[2] === true) {
+                    finish(true);
+                } else {
+                    process.stderr.write(`publish-rejected url=${url} reason=${truncate(msg[3])}\n`);
+                    settleRelay(idx);
+                }
+            } else if (msg[0] === 'NOTICE') {
+                process.stderr.write(`relay-notice url=${url} msg=${truncate(msg[1])}\n`);
+            }
+        });
+    });
+}
+
 // ── help ──
 
 function doHelp() {
@@ -469,6 +691,7 @@ function doHelp() {
             'poll',
             'send <npub> <body>',
             'search [--tag <topic>] [--kind n] [--limit n] [--since 7d] [--author <npub>] [<keyword>]',
+            'reply <parent-event-id> <body>',
             'whoami',
             'help',
         ],

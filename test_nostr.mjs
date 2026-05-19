@@ -947,6 +947,387 @@ const pkNoter = getPublicKey(skNoter);
     rProc.close(); rFile.close();
 }
 
+// ── 56-72: nostr.mjs reply (NIP-10 kind:1 reply) ──
+
+console.log('\nReply:');
+
+// replyMockRelay: serves a configured event on REQ (regardless of filter),
+// optionally OKs the publish EVENT, records published events for assertion.
+// `silent: true` makes the relay accept connections but never send anything --
+// used by the multi-relay hang regression.
+async function replyMockRelay(port, eventToServe, { okPublish = true, silent = false } = {}) {
+    const wss = new WebSocketServer({ port });
+    const published = [];   // events captured from EVENT frames
+    const recvReqs = [];    // REQ filters captured
+    wss.on('connection', (ws) => {
+        if (silent) return;   // accept conn, never respond
+        ws.on('message', (raw) => {
+            let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
+            if (msg[0] === 'REQ') {
+                recvReqs.push({ sid: msg[1], filter: msg[2] });
+                if (eventToServe) {
+                    try { ws.send(JSON.stringify(['EVENT', msg[1], eventToServe])); } catch {}
+                }
+                try { ws.send(JSON.stringify(['EOSE', msg[1]])); } catch {}
+            } else if (msg[0] === 'EVENT' && msg[1] && msg[1].kind === 1) {
+                published.push(msg[1]);
+                try { ws.send(JSON.stringify(['OK', msg[1].id, okPublish, okPublish ? '' : 'test-reject'])); } catch {}
+            }
+        });
+    });
+    return { port, published, recvReqs, close: () => wss.close() };
+}
+
+function runReply(args, env = {}) {
+    return new Promise((resolve) => {
+        const childEnv = { ...process.env, NOSTR_REPLY_TIMEOUT_MS: '2000' };
+        delete childEnv.NOSTR_SEARCH_RELAYS;
+        Object.assign(childEnv, env);
+        const proc = spawn('node', [CLI, ...baseFlags, 'reply', ...args], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            env: childEnv,
+        });
+        let stdout = '', stderr = '';
+        proc.stdout.on('data', (d) => { stdout += d.toString(); });
+        proc.stderr.on('data', (d) => { stderr += d.toString(); });
+        proc.on('close', (code) => {
+            resolve({ stdout: stdout.trim(), stderr: stderr.trim(), status: code || 0 });
+        });
+    });
+}
+
+// Shared identity for the reply path tests. login generates nsec into env.
+{
+    writeEnv('');
+    run('login');
+}
+
+const skSomeAuthor = generateSecretKey();
+const pkSomeAuthor = getPublicKey(skSomeAuthor);
+const skGrandparent = generateSecretKey();
+const pkGrandparent = getPublicKey(skGrandparent);
+const skRootAuthor = generateSecretKey();
+const pkRootAuthor = getPublicKey(skRootAuthor);
+
+// `signNote` is defined earlier in the file (search section). Reuse it.
+
+// 56: Reply to top-level note -- 5-field root e-tag with parent.pubkey
+{
+    const port = 38000 + Math.floor(Math.random() * 50);
+    const parent = signNote(skSomeAuthor, 'top-level parent note', []);
+    const r = await replyMockRelay(port, parent);
+    // Preserve nsec; only swap relays
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=ws://127.0.0.1:${port}\n`);
+
+    const res = await runReply([parent.id, 'thanks for the note']);
+    assertEq(0, res.status, '56a: reply to top-level exits 0');
+    const out = JSON.parse(res.stdout);
+    assertEq(true, out.ok, '56b: ok=true');
+    const tags = out.tags;
+    assertEq(2, tags.length, '56c: top-level reply emits exactly e-root + p');
+    const eRoot = tags.find(t => t[0] === 'e');
+    assertEq(parent.id, eRoot[1], '56d: e-root id matches parent');
+    assertEq('root', eRoot[3], '56e: marker is root');
+    assertEq(parent.pubkey, eRoot[4], '56f: e-root 5th field is parent author (NIP-10 current)');
+    r.close();
+}
+
+// 57: Reply to a nested reply with known root author
+{
+    const port = 38050 + Math.floor(Math.random() * 50);
+    const realRootId = 'a'.repeat(64);
+    const parent = signNote(skSomeAuthor, 'a nested reply', [
+        ['e', realRootId, '', 'root', pkRootAuthor],
+        ['p', pkGrandparent],
+    ]);
+    const r = await replyMockRelay(port, parent);
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=ws://127.0.0.1:${port}\n`);
+
+    const res = await runReply([parent.id, 'jumping into the thread']);
+    assertEq(0, res.status, '57a: nested reply exits 0');
+    const tags = JSON.parse(res.stdout).tags;
+    const eRoot = tags.find(t => t[0] === 'e' && t[3] === 'root');
+    const eReply = tags.find(t => t[0] === 'e' && t[3] === 'reply');
+    assertEq(realRootId, eRoot[1], '57b: root id carried forward');
+    assertEq(pkRootAuthor, eRoot[4], '57c: root author 5th field carried (NIP-10 current)');
+    assertEq(parent.id, eReply[1], '57d: reply id is direct parent');
+    assertEq(parent.pubkey, eReply[4], '57e: reply 5th field is parent author');
+    const pTags = tags.filter(t => t[0] === 'p').map(t => t[1]);
+    assertTrue(pTags.includes(parent.pubkey), '57f: p chain includes parent');
+    assertTrue(pTags.includes(pkGrandparent), '57g: p chain includes grandparent');
+    r.close();
+}
+
+// 58: Malformed/missing root author -> 4-tuple root tag (no 5th field)
+{
+    const port = 38100 + Math.floor(Math.random() * 50);
+    const realRootId = 'b'.repeat(64);
+    const parent = signNote(skSomeAuthor, 'nested with bad root author', [
+        ['e', realRootId, '', 'root', 'not-hex-garbage'],
+    ]);
+    const r = await replyMockRelay(port, parent);
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=ws://127.0.0.1:${port}\n`);
+
+    const res = await runReply([parent.id, 'reply']);
+    const tags = JSON.parse(res.stdout).tags;
+    const eRoot = tags.find(t => t[0] === 'e' && t[3] === 'root');
+    assertEq(4, eRoot.length, '58: malformed root author -> 4-tuple e-root (no 5th field)');
+    r.close();
+}
+
+// 59: Malformed parent p tag dropped (codex r1 P2)
+{
+    const port = 38150 + Math.floor(Math.random() * 50);
+    const validP = 'c'.repeat(64);
+    const parent = signNote(skSomeAuthor, 'has bad p tag', [
+        ['p', 'javascript:alert(1)'],
+        ['p', validP],
+    ]);
+    const r = await replyMockRelay(port, parent);
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=ws://127.0.0.1:${port}\n`);
+
+    const res = await runReply([parent.id, 'hi']);
+    const pTags = JSON.parse(res.stdout).tags.filter(t => t[0] === 'p').map(t => t[1]);
+    assertTrue(!pTags.includes('javascript:alert(1)'), '59a: malformed p value not carried');
+    assertTrue(pTags.includes(parent.pubkey), '59b: parent author p included');
+    assertTrue(pTags.includes(validP), '59c: valid p carried through');
+    r.close();
+}
+
+// 60: Malformed root marker -> treat parent as root
+{
+    const port = 38200 + Math.floor(Math.random() * 50);
+    const parent = signNote(skSomeAuthor, 'bad root id', [
+        ['e', 'not-a-real-hex-id', '', 'root'],
+    ]);
+    const r = await replyMockRelay(port, parent);
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=ws://127.0.0.1:${port}\n`);
+
+    const res = await runReply([parent.id, 'hi']);
+    const tags = JSON.parse(res.stdout).tags;
+    const eTags = tags.filter(t => t[0] === 'e');
+    assertEq(1, eTags.length, '60a: only one e-tag emitted (parent treated as root)');
+    assertEq('root', eTags[0][3], '60b: marker is root');
+    assertEq(parent.id, eTags[0][1], '60c: id is parent itself');
+    r.close();
+}
+
+// 61: Outbound body sanitized
+{
+    const port = 38250 + Math.floor(Math.random() * 50);
+    const parent = signNote(skSomeAuthor, 'sanitize-test parent', []);
+    const r = await replyMockRelay(port, parent);
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=ws://127.0.0.1:${port}\n`);
+
+    const payload = 'Hello X\u{E0065}\u{E0076}\u{E0069}\u{E006C} World';
+    await runReply([parent.id, payload]);
+    const published = r.published[0];
+    assertEq('Hello X World', published.content, '61: smuggled tag-block stripped from outbound content');
+    r.close();
+}
+
+// 62: Empty body after sanitize -> reject
+{
+    const port = 38300 + Math.floor(Math.random() * 50);
+    const parent = signNote(skSomeAuthor, 'empty-sanitize-test', []);
+    const r = await replyMockRelay(port, parent);
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=ws://127.0.0.1:${port}\n`);
+
+    // Body of only tag-block chars sanitizes to empty.
+    const res = await runReply([parent.id, '\u{E0061}\u{E0062}\u{E0063}']);
+    assertEq(1, res.status, '62a: empty-after-sanitize exits 1');
+    assertJsonField(res.stdout, 'error', 'empty-body-after-sanitize', '62b: error code matches');
+    r.close();
+}
+
+// 63: Bad parent id format
+{
+    const res = await runReply(['not-a-real-hex-id', 'body']);
+    assertEq(1, res.status, '63a: bad-parent-event-id exits 1');
+    assertJsonField(res.stdout, 'error', 'bad-parent-event-id', '63b: error code matches');
+}
+
+// 64: Parent not found (relay returns no events)
+{
+    const port = 38400 + Math.floor(Math.random() * 50);
+    const r = await replyMockRelay(port, null);  // null = no parent to serve
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=ws://127.0.0.1:${port}\n`);
+
+    const ghost = 'd'.repeat(64);
+    const res = await runReply([ghost, 'body']);
+    assertEq(1, res.status, '64a: parent-not-found exits 1');
+    assertJsonField(res.stdout, 'error', 'parent-not-found', '64b: error code matches');
+    r.close();
+}
+
+// 65: Mismatched id from relay (codex r1 P2 -- non-binding filter attack).
+//     Two distinct VALID signed kind:1 events: we request `realParent.id`,
+//     relay serves `decoy` (also valid sig, also kind:1, just different id).
+//     resolveEvent must reject because ev.id !== requested, NOT because
+//     the sig is broken (codex r3 P2 -- earlier mutation-style test
+//     incidentally broke the sig and passed for the wrong reason).
+{
+    const port = 38450 + Math.floor(Math.random() * 50);
+    const realParent = signNote(skSomeAuthor, 'real parent we ask for', []);
+    const decoy = signNote(skGrandparent, 'valid signed kind:1 with a different id', []);
+    assertTrue(realParent.id !== decoy.id, '65pre: real parent and decoy have distinct ids');
+    assertTrue(verifyEvent(decoy), '65pre: decoy has valid signature');
+    const r = await replyMockRelay(port, decoy);  // mock serves decoy in response to any REQ
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=ws://127.0.0.1:${port}\n`);
+
+    const res = await runReply([realParent.id, 'body']);
+    assertEq(1, res.status, '65a: valid-sig wrong-id rejected, exits 1');
+    assertJsonField(res.stdout, 'error', 'parent-not-found', '65b: rejected as parent-not-found');
+    r.close();
+}
+
+// 66: Wrong-kind parent rejected
+{
+    const port = 38500 + Math.floor(Math.random() * 50);
+    const profile = finalizeEvent({
+        kind: 0,
+        created_at: Math.floor(Date.now() / 1000),
+        content: '{"name":"someone"}',
+        tags: [],
+    }, skSomeAuthor);
+    const r = await replyMockRelay(port, profile);
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=ws://127.0.0.1:${port}\n`);
+
+    const res = await runReply([profile.id, 'body']);
+    assertEq(1, res.status, '66a: kind:0 parent rejected, exits 1');
+    assertJsonField(res.stdout, 'error', 'parent-not-found', '66b: rejected as parent-not-found');
+    r.close();
+}
+
+// 67: Bad-sig parent rejected
+{
+    const port = 38550 + Math.floor(Math.random() * 50);
+    const realParent = signNote(skSomeAuthor, 'bad-sig-test', []);
+    const tampered = { ...realParent, sig: '00'.repeat(64) };
+    const r = await replyMockRelay(port, tampered);
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=ws://127.0.0.1:${port}\n`);
+
+    const res = await runReply([realParent.id, 'body']);
+    assertEq(1, res.status, '67a: bad-sig parent rejected, exits 1');
+    assertJsonField(res.stdout, 'error', 'parent-not-found', '67b: rejected as parent-not-found');
+    r.close();
+}
+
+// 68: Publish failure when no relay OKs
+{
+    const port = 38600 + Math.floor(Math.random() * 50);
+    const parent = signNote(skSomeAuthor, 'publish-fail-test', []);
+    const r = await replyMockRelay(port, parent, { okPublish: false });
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=ws://127.0.0.1:${port}\n`);
+
+    const res = await runReply([parent.id, 'body']);
+    assertEq(1, res.status, '68a: publish-failed exits 1');
+    assertJsonField(res.stdout, 'error', 'publish-failed', '68b: error code matches');
+    r.close();
+}
+
+// 69: Resolved relay used as NIP-10 hint (codex r1 P3)
+{
+    const portA = 38650 + Math.floor(Math.random() * 25);
+    const portB = 38680 + Math.floor(Math.random() * 25);
+    // Relay A has nothing; relay B has the parent. Hint must point to B.
+    const rA = await replyMockRelay(portA, null);
+    const parent = signNote(skSomeAuthor, 'hint-test parent', []);
+    const rB = await replyMockRelay(portB, parent);
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=ws://127.0.0.1:${portA},ws://127.0.0.1:${portB}\n`);
+
+    const res = await runReply([parent.id, 'body']);
+    const eRoot = JSON.parse(res.stdout).tags.find(t => t[0] === 'e');
+    assertEq(`ws://127.0.0.1:${portB}`, eRoot[2], '69: relay hint is the relay that delivered parent');
+    rA.close(); rB.close();
+}
+
+// 70: Uppercase parentId normalized (codex r2 P3)
+{
+    const port = 38730 + Math.floor(Math.random() * 30);
+    const parent = signNote(skSomeAuthor, 'uppercase-id-test', []);
+    const r = await replyMockRelay(port, parent);
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=ws://127.0.0.1:${port}\n`);
+
+    const res = await runReply([parent.id.toUpperCase(), 'body']);
+    assertEq(0, res.status, '70a: uppercase parentId resolves');
+    const out = JSON.parse(res.stdout);
+    assertEq(parent.id, out.parent, '70b: returned parent id is lowercase');
+    r.close();
+}
+
+// 71: Mixed-case parent tag normalized to lowercase in emitted reply
+{
+    const port = 38770 + Math.floor(Math.random() * 30);
+    const mixedRoot = 'A'.repeat(32) + 'a'.repeat(32);
+    const mixedP = 'B'.repeat(32) + 'b'.repeat(32);
+    const parent = signNote(skSomeAuthor, 'mixed-case-tags', [
+        ['e', mixedRoot, '', 'root'],
+        ['p', mixedP],
+    ]);
+    const r = await replyMockRelay(port, parent);
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=ws://127.0.0.1:${port}\n`);
+
+    const res = await runReply([parent.id, 'body']);
+    const tags = JSON.parse(res.stdout).tags;
+    const eRoot = tags.find(t => t[0] === 'e' && t[3] === 'root');
+    assertEq(mixedRoot.toLowerCase(), eRoot[1], '71a: mixed-case root id lowercased');
+    const pVals = tags.filter(t => t[0] === 'p').map(t => t[1]);
+    assertTrue(pVals.includes(mixedP.toLowerCase()), '71b: mixed-case p value lowercased');
+    r.close();
+}
+
+// 72: Empty body (no args) -> usage error
+{
+    const ghost = 'd'.repeat(64);
+    const res = await runReply([ghost]);
+    assertEq(1, res.status, '72a: empty body exits 1');
+    assertContains(res.stdout, 'usage:', '72b: error mentions usage');
+}
+
+// 73: Multi-relay success exits promptly (codex r3 P1 -- hang regression).
+//     Relay A returns the parent + OKs the publish. Relay B accepts the
+//     connection but never sends anything. The subprocess must close ALL
+//     sockets on success, not just the one that delivered the event,
+//     otherwise Node keeps the silent socket alive and the process never
+//     exits. We assert close-on-stdout time is well under the 2s timeout.
+{
+    const portA = 38900 + Math.floor(Math.random() * 25);
+    const portB = 38930 + Math.floor(Math.random() * 25);
+    const parent = signNote(skSomeAuthor, 'multi-relay-hang-test', []);
+    const rA = await replyMockRelay(portA, parent);          // serves + OKs
+    const rB = await replyMockRelay(portB, null, { silent: true });  // accepts, never speaks
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=ws://127.0.0.1:${portA},ws://127.0.0.1:${portB}\n`);
+
+    const t0 = Date.now();
+    const res = await runReply([parent.id, 'should exit promptly']);
+    const elapsed = Date.now() - t0;
+    assertEq(0, res.status, '73a: multi-relay success exits 0');
+    // 2s is the NOSTR_REPLY_TIMEOUT_MS the test runner sets. The fixed
+    // resolveEvent + publishOneShot close ALL sockets on first success,
+    // so the subprocess should exit in well under 1s. Pre-fix this hung
+    // until the timer expired (then the per-relay timeout cleanup ran).
+    assertTrue(elapsed < 1500,
+        `73b: subprocess exits promptly after success (got ${elapsed}ms; pre-fix hung > 2000ms)`);
+    rA.close(); rB.close();
+}
+
 // ── Summary ──
 
 console.log('');
