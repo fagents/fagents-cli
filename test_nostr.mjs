@@ -1328,6 +1328,416 @@ const pkRootAuthor = getPublicKey(skRootAuthor);
     rA.close(); rB.close();
 }
 
+// ── 74-95: nostr.mjs profile (kind:0 set/get) ──
+
+console.log('\nProfile:');
+
+// profileMockRelay: serves a configured kind:0 (or none) in response to
+// REQ with authors filter; captures published kind:0 events on EVENT,
+// OKs them by default.
+async function profileMockRelay(port, kind0Event, { okPublish = true, silent = false } = {}) {
+    const wss = new WebSocketServer({ port });
+    const published = [];
+    const recvReqs = [];
+    wss.on('connection', (ws) => {
+        if (silent) return;
+        ws.on('message', (raw) => {
+            let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
+            if (msg[0] === 'REQ') {
+                recvReqs.push({ sid: msg[1], filter: msg[2] });
+                if (kind0Event) {
+                    try { ws.send(JSON.stringify(['EVENT', msg[1], kind0Event])); } catch {}
+                }
+                try { ws.send(JSON.stringify(['EOSE', msg[1]])); } catch {}
+            } else if (msg[0] === 'EVENT' && msg[1] && msg[1].kind === 0) {
+                published.push(msg[1]);
+                try { ws.send(JSON.stringify(['OK', msg[1].id, okPublish, okPublish ? '' : 'test-reject'])); } catch {}
+            }
+        });
+    });
+    return { port, published, recvReqs, close: () => wss.close() };
+}
+
+function runProfile(args, env = {}) {
+    return new Promise((resolve) => {
+        const childEnv = { ...process.env, NOSTR_PROFILE_TIMEOUT_MS: '1500' };
+        delete childEnv.NOSTR_SEARCH_RELAYS;
+        Object.assign(childEnv, env);
+        const proc = spawn('node', [CLI, ...baseFlags, 'profile', ...args], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            env: childEnv,
+        });
+        let stdout = '', stderr = '';
+        proc.stdout.on('data', (d) => { stdout += d.toString(); });
+        proc.stderr.on('data', (d) => { stderr += d.toString(); });
+        proc.on('close', (code) => {
+            resolve({ stdout: stdout.trim(), stderr: stderr.trim(), status: code || 0 });
+        });
+    });
+}
+
+// Reuse the existing nsec written by the reply tests' login() call.
+const ownNsec = readFileSync(envFile, 'utf8').split('\n').find(l => l.startsWith('NOSTR_NSEC=')).slice('NOSTR_NSEC='.length);
+const ownSk = nip19.decode(ownNsec).data;
+
+function signKind0(sk, contentObj, createdAt) {
+    return finalizeEvent({
+        kind: 0,
+        created_at: createdAt ?? Math.floor(Date.now() / 1000),
+        tags: [],
+        content: JSON.stringify(contentObj),
+    }, sk);
+}
+
+function pointEnvToRelays(...urls) {
+    const e = readFileSync(envFile, 'utf8');
+    writeFileSync(envFile, e.replace(/^NOSTR_RELAYS=.*\n?/m, '') + `NOSTR_RELAYS=${urls.join(',')}\n`);
+}
+
+// 74: Set replace mode -- only specified fields published
+{
+    const port = 39000 + Math.floor(Math.random() * 50);
+    const existing = signKind0(ownSk, { name: 'old', about: 'oldabout' });
+    const r = await profileMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runProfile(['set', '--name', 'NewOnly', '--picture', 'https://x.com/a.png', '--replace']);
+    assertEq(0, res.status, '74a: replace exits 0');
+    const content = JSON.parse(r.published[0].content);
+    assertEq('NewOnly', content.name, '74b: replace sets new name');
+    assertEq('https://x.com/a.png', content.picture, '74c: replace sets new picture');
+    assertTrue(!('about' in content), '74d: replace drops untouched fields');
+    r.close();
+}
+
+// 75: Merge mode preserves untouched fields
+{
+    const port = 39050 + Math.floor(Math.random() * 50);
+    const existing = signKind0(ownSk, { name: 'KeepName', about: 'OldAbout' });
+    const r = await profileMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    await runProfile(['set', '--about', 'NewAbout']);
+    const content = JSON.parse(r.published[0].content);
+    assertEq('KeepName', content.name, '75a: merge preserves untouched name');
+    assertEq('NewAbout', content.about, '75b: merge writes new about');
+    r.close();
+}
+
+// 76: stdout has ok/id/npub/profile after successful set
+{
+    const port = 39100 + Math.floor(Math.random() * 50);
+    const r = await profileMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runProfile(['set', '--name', 'Test', '--replace']);
+    const out = JSON.parse(res.stdout);
+    assertEq(true, out.ok, '76a: ok=true');
+    assertTrue(typeof out.id === 'string' && out.id.length === 64, '76b: id is 64-hex');
+    assertTrue(out.npub.startsWith('npub1'), '76c: npub returned');
+    assertEq('Test', out.profile.name, '76d: profile returned');
+    r.close();
+}
+
+// 77: resolveProfile picks LATEST across relays (codex r1 P1)
+{
+    const portA = 39150 + Math.floor(Math.random() * 25);
+    const portB = 39175 + Math.floor(Math.random() * 25);
+    const now = Math.floor(Date.now() / 1000);
+    const older = signKind0(ownSk, { name: 'OLDER', about: 'old' }, now - 3600);
+    const newer = signKind0(ownSk, { name: 'NEWER', about: 'new' }, now);
+    const rA = await profileMockRelay(portA, older);
+    const rB = await profileMockRelay(portB, newer);
+    pointEnvToRelays(`ws://127.0.0.1:${portA}`, `ws://127.0.0.1:${portB}`);
+    const res = await runProfile(['get']);
+    const out = JSON.parse(res.stdout);
+    assertEq('NEWER', out.content.name, '77a: latest-wins on get');
+    assertEq('new', out.content.about, '77b: full latest content returned');
+    rA.close(); rB.close();
+}
+
+// 78: tie-break on equal created_at by lexicographic id
+{
+    const portA = 39200 + Math.floor(Math.random() * 25);
+    const portB = 39225 + Math.floor(Math.random() * 25);
+    const sameTs = Math.floor(Date.now() / 1000);
+    const evX = signKind0(ownSk, { name: 'AAA-tie-x', about: 'x' }, sameTs);
+    const evY = signKind0(ownSk, { name: 'BBB-tie-y', about: 'y' }, sameTs);
+    const winner = evX.id < evY.id ? evX : evY;
+    const rA = await profileMockRelay(portA, evX);
+    const rB = await profileMockRelay(portB, evY);
+    pointEnvToRelays(`ws://127.0.0.1:${portA}`, `ws://127.0.0.1:${portB}`);
+    const res = await runProfile(['get']);
+    const out = JSON.parse(res.stdout);
+    assertEq(JSON.parse(winner.content).name, out.content.name, '78: deterministic id tiebreak');
+    rA.close(); rB.close();
+}
+
+// 79: merge mode uses LATEST as base
+{
+    const portA = 39250 + Math.floor(Math.random() * 25);
+    const portB = 39275 + Math.floor(Math.random() * 25);
+    const now = Math.floor(Date.now() / 1000);
+    const older = signKind0(ownSk, { name: 'IGNORED', about: 'old-about' }, now - 7200);
+    const newer = signKind0(ownSk, { name: 'KeepNew', about: 'should-be-merged-over' }, now);
+    const rA = await profileMockRelay(portA, older);
+    const rB = await profileMockRelay(portB, newer);
+    pointEnvToRelays(`ws://127.0.0.1:${portA}`, `ws://127.0.0.1:${portB}`);
+    await runProfile(['set', '--about', 'NewAbout']);
+    const pub = rA.published[0] || rB.published[0];
+    const content = JSON.parse(pub.content);
+    assertEq('KeepNew', content.name, '79a: merge base is the NEWER profile');
+    assertEq('NewAbout', content.about, '79b: new about overrides newer base');
+    rA.close(); rB.close();
+}
+
+// 80-83: URL validation
+{
+    const port = 39300 + Math.floor(Math.random() * 50);
+    const r = await profileMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    const cases = [
+        { args: ['set', '--picture', 'javascript:alert(1)', '--replace'], code: 'bad-picture-scheme', label: '80a: javascript: rejected' },
+        { args: ['set', '--banner', 'data:image/png;base64,abc', '--replace'], code: 'bad-banner-scheme', label: '80b: data: rejected' },
+        { args: ['set', '--picture', 'http://', '--replace'], code: 'bad-picture-format', label: '81a: bare http:// rejected (no host)' },
+        { args: ['set', '--picture', 'https://exa mple.com/x', '--replace'], code: 'bad-picture-format', label: '81b: whitespace in URL rejected' },
+        { args: ['set', '--picture', 'https://example.com/\u{E0065}\u{E0076}\u{E0069}\u{E006C}', '--replace'], code: 'bad-picture-format', label: '81c: invisible-Unicode URL rejected (codex r2 P2.1)' },
+    ];
+    for (const c of cases) {
+        const res = await runProfile(c.args);
+        assertJsonField(res.stdout, 'error', c.code, c.label);
+    }
+
+    const okHttps = await runProfile(['set', '--picture', 'https://example.com/avatar.png', '--replace']);
+    assertEq(0, okHttps.status, '82a: valid https URL accepted');
+    const okHttp = await runProfile(['set', '--picture', 'http://example.com/avatar.png', '--replace']);
+    assertEq(0, okHttp.status, '82b: valid http URL accepted');
+    r.close();
+}
+
+// 83: Flag-shaped value rejected for every field (codex r3 P2 regression).
+//     Without the shiftProfileValue guard, `--name --replace` would
+//     consume `--replace` as the name string and silently publish bogus
+//     public profile metadata.
+{
+    const port = 39380 + Math.floor(Math.random() * 20);
+    const r = await profileMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    const cases = [
+        { args: ['set', '--name', '--replace'],    code: 'bad-name-empty',    label: '83a: --name --replace rejected' },
+        { args: ['set', '--about', '--replace'],   code: 'bad-about-empty',   label: '83b: --about --replace rejected' },
+        { args: ['set', '--picture', '--replace'], code: 'bad-picture-empty', label: '83c: --picture --replace rejected' },
+        { args: ['set', '--banner', '--replace'],  code: 'bad-banner-empty',  label: '83d: --banner --replace rejected' },
+        { args: ['set', '--nip05', '--replace'],   code: 'bad-nip05-empty',   label: '83e: --nip05 --replace rejected' },
+        { args: ['set', '--lud16', '--replace'],   code: 'bad-lud16-empty',   label: '83f: --lud16 --replace rejected' },
+        { args: ['set', '--website', '--replace'], code: 'bad-website-empty', label: '83g: --website --replace rejected' },
+    ];
+    for (const c of cases) {
+        const res = await runProfile(c.args);
+        assertJsonField(res.stdout, 'error', c.code, c.label);
+        // Critical: must NOT have reached the publish path. The mock
+        // captures published EVENTs; assert nothing landed.
+    }
+    assertEq(0, r.published.length, '83h: nothing published when value was flag-shaped');
+    r.close();
+}
+
+// 84: Bad nip05 format
+{
+    const port = 39400 + Math.floor(Math.random() * 50);
+    const r = await profileMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runProfile(['set', '--nip05', 'notanemail']);
+    assertJsonField(res.stdout, 'error', 'bad-nip05-format', '84: bad nip05 rejected');
+    r.close();
+}
+
+// 84b: Handle field with smuggled Unicode rejected (codex r4-simplify
+//      consistency with URL field posture -- no silent strip).
+{
+    const port = 39420 + Math.floor(Math.random() * 30);
+    const r = await profileMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    // ZWSP between local and @ -- sanitize would strip and produce a
+    // valid-looking address. Must instead reject as bad-nip05-format.
+    const res = await runProfile(['set', '--nip05', 'foo\u{200B}@bar.com']);
+    assertJsonField(res.stdout, 'error', 'bad-nip05-format', '84b: nip05 with smuggled ZWSP rejected');
+    r.close();
+}
+
+// 84c: Array-as-existing-profile-content handled cleanly (codex r4
+//      simplify -- typeof [] === 'object' edge case).
+{
+    const port = 39450 + Math.floor(Math.random() * 30);
+    // Hand-roll an existing kind:0 whose content is a JSON array, not
+    // object. cleanProfileMetadata must return {} (no crash, no leak).
+    const arrayContent = finalizeEvent({
+        kind: 0,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [],
+        content: JSON.stringify(['some', 'array']),
+    }, ownSk);
+    const r = await profileMockRelay(port, arrayContent);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runProfile(['set', '--about', 'NewAbout']);
+    const content = JSON.parse(r.published[0].content);
+    assertEq('NewAbout', content.about, '84c: merge still publishes new about');
+    // Array-shaped base contributed nothing -- only the agent-supplied
+    // about field is present, no v1 key from the array index.
+    assertEq(1, Object.keys(content).length, '84c-2: only new field present (array base dropped)');
+    r.close();
+}
+
+// 85: Oversized name rejected
+{
+    const port = 39450 + Math.floor(Math.random() * 50);
+    const r = await profileMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runProfile(['set', '--name', 'x'.repeat(501)]);
+    assertJsonField(res.stdout, 'error', 'bad-name-too-long', '85: oversized name rejected');
+    r.close();
+}
+
+// 86: Merge cleanup drops unknown keys from base
+{
+    const port = 39500 + Math.floor(Math.random() * 50);
+    const existing = signKind0(ownSk, { name: 'GoodName', junk: 'hello', nested: { a: 1 } });
+    const r = await profileMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    await runProfile(['set', '--about', 'NewAbout']);
+    const content = JSON.parse(r.published[0].content);
+    assertEq('GoodName', content.name, '86a: known key preserved');
+    assertEq('NewAbout', content.about, '86b: new field present');
+    assertTrue(!('junk' in content), '86c: unknown key dropped');
+    assertTrue(!('nested' in content), '86d: nested object dropped');
+    r.close();
+}
+
+// 87: Merge cleanup drops invalid URL in existing base
+{
+    const port = 39550 + Math.floor(Math.random() * 50);
+    const existing = signKind0(ownSk, { name: 'OK', picture: 'javascript:alert(1)' });
+    const r = await profileMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    await runProfile(['set', '--about', 'Y']);
+    const content = JSON.parse(r.published[0].content);
+    assertEq('OK', content.name, '87a: name preserved');
+    assertEq('Y', content.about, '87b: about set');
+    assertTrue(!('picture' in content), '87c: bad-URL picture dropped');
+    r.close();
+}
+
+// 88: Merge cleanup sanitizes pre-existing smuggling in base strings
+{
+    const port = 39600 + Math.floor(Math.random() * 50);
+    const existing = signKind0(ownSk, { name: 'X\u{E0065}\u{E0076}\u{E0069}\u{E006C}' });
+    const r = await profileMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    await runProfile(['set', '--about', 'Y']);
+    const content = JSON.parse(r.published[0].content);
+    assertEq('X', content.name, '88: smuggling stripped from pre-existing base');
+    r.close();
+}
+
+// 89: publish-failed when no relay OKs
+{
+    const port = 39650 + Math.floor(Math.random() * 50);
+    const r = await profileMockRelay(port, null, { okPublish: false });
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runProfile(['set', '--name', 'Test', '--replace']);
+    assertJsonField(res.stdout, 'error', 'publish-failed', '89: publish-failed bubbled');
+    r.close();
+}
+
+// 90: Get own with no arg
+{
+    const port = 39700 + Math.floor(Math.random() * 50);
+    const existing = signKind0(ownSk, { name: 'OwnName', about: 'me' });
+    const r = await profileMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runProfile(['get']);
+    const out = JSON.parse(res.stdout);
+    assertEq('OwnName', out.content.name, '90a: own profile returned');
+    assertEq('me', out.content.about, '90b: own profile content correct');
+    r.close();
+}
+
+// 91: Get other npub
+{
+    const otherSk = generateSecretKey();
+    const otherPk = getPublicKey(otherSk);
+    const port = 39750 + Math.floor(Math.random() * 50);
+    const existing = signKind0(otherSk, { name: 'OtherName', about: 'them' });
+    const r = await profileMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runProfile(['get', nip19.npubEncode(otherPk)]);
+    const out = JSON.parse(res.stdout);
+    assertEq('OtherName', out.content.name, '91a: other profile returned');
+    assertEq(otherPk, out.pubkey, '91b: pubkey matches target');
+    r.close();
+}
+
+// 92: Get drops nested objects + unknown keys (codex r2 P2.2)
+{
+    const otherSk = generateSecretKey();
+    const otherPk = getPublicKey(otherSk);
+    const port = 39800 + Math.floor(Math.random() * 50);
+    const existing = signKind0(otherSk, {
+        name: 'CleanName',
+        extras: { hidden: 'X\u{E0065}\u{E0076}\u{E0069}\u{E006C}smuggled' },
+        custom_field: 'not-in-v1',
+    });
+    const r = await profileMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runProfile(['get', nip19.npubEncode(otherPk)]);
+    const out = JSON.parse(res.stdout);
+    assertEq('CleanName', out.content.name, '92a: known field returned');
+    assertTrue(!('extras' in out.content), '92b: nested object dropped');
+    assertTrue(!('custom_field' in out.content), '92c: unknown key dropped');
+    r.close();
+}
+
+// 93: Get bad-sig profile rejected
+{
+    const otherSk = generateSecretKey();
+    const otherPk = getPublicKey(otherSk);
+    const port = 39850 + Math.floor(Math.random() * 50);
+    const good = signKind0(otherSk, { name: 'X' });
+    const bad = { ...good, sig: '00'.repeat(64) };
+    const r = await profileMockRelay(port, bad);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runProfile(['get', nip19.npubEncode(otherPk)]);
+    assertEq(1, res.status, '93a: bad-sig profile exits 1');
+    assertJsonField(res.stdout, 'error', 'profile-not-found', '93b: bad-sig rejected as not-found');
+    r.close();
+}
+
+// 94: Get author-mismatch rejected
+{
+    const otherSk = generateSecretKey();
+    const otherPk = getPublicKey(otherSk);
+    const decoySk = generateSecretKey();
+    const port = 39900 + Math.floor(Math.random() * 50);
+    const decoyProfile = signKind0(decoySk, { name: 'decoy' });
+    const r = await profileMockRelay(port, decoyProfile);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runProfile(['get', nip19.npubEncode(otherPk)]);
+    assertEq(1, res.status, '94a: author-mismatch exits 1');
+    assertJsonField(res.stdout, 'error', 'profile-not-found', '94b: author-mismatch rejected');
+    r.close();
+}
+
+// 95: Get profile-not-found when relay has nothing
+{
+    const otherSk = generateSecretKey();
+    const otherPk = getPublicKey(otherSk);
+    const port = 39950 + Math.floor(Math.random() * 50);
+    const r = await profileMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runProfile(['get', nip19.npubEncode(otherPk)]);
+    assertJsonField(res.stdout, 'error', 'profile-not-found', '95: no events -> profile-not-found');
+    r.close();
+}
+
 // ── Summary ──
 
 console.log('');

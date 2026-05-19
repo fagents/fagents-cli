@@ -130,6 +130,20 @@ function writeEnvMerge(path, updates) {
 
 const DEFAULT_RELAYS = 'wss://relay.damus.io,wss://nos.lol,wss://nostr.wine';
 
+// Profile (kind:0) v1 known fields. Declared here so they're initialized
+// before any `await doX()` dispatch in the command switch; doProfile
+// runs while module top-level is paused on its await and would TDZ-trap
+// these if they were declared in the profile section below.
+// PROFILE_V1_KEYS is DERIVED from the partition Sets so adding a new
+// field to one Set propagates to cleanProfileMetadata + arg parser
+// without needing to update two lists.
+const PROFILE_URL_KEYS = new Set(['picture', 'banner', 'website']);
+const PROFILE_HANDLE_KEYS = new Set(['nip05', 'lud16']);
+const PROFILE_STRING_KEYS = new Set(['name', 'about']);
+const PROFILE_V1_KEYS = [...PROFILE_STRING_KEYS, ...PROFILE_HANDLE_KEYS, ...PROFILE_URL_KEYS];
+const NIP05_RE = /^[A-Za-z0-9_.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+const MAX_PROFILE_FIELD_LEN = 500;
+
 function parseRelayList(s) {
     if (!s) return undefined;
     const out = String(s).split(',').map(x => x.trim()).filter(Boolean);
@@ -303,6 +317,7 @@ switch (cmd) {
     case 'send':   await doSend(); break;
     case 'search': await doSearch(); break;
     case 'reply':  await doReply(); break;
+    case 'profile': await doProfile(); break;
     case 'whoami': doWhoami(); break;
     case 'help': case '--help': case '-h': default: doHelp(); break;
 }
@@ -680,6 +695,290 @@ function publishOneShot(event, relays, timeoutMs) {
     });
 }
 
+// ── profile: read/write kind:0 metadata (agent's own or someone else's) ──
+//
+// kind:0 is a replaceable event whose `content` is a JSON-stringified
+// metadata blob (name / about / picture / banner / nip05 / lud16 /
+// website per NIP-01 v1 known fields). Replaceable means relays only
+// keep the latest, but clients cache + quote old versions -- a softer
+// permanence than kind:1 but real.
+//
+// The PROFILE_* constants live at the top of the file (alongside
+// DEFAULT_RELAYS), NOT here, because the dispatch switch above does
+// `await doX()` which leaves any const declared further down in the
+// temporal dead zone for the lifetime of the awaited command.
+
+// Field-value checkers. Each returns `{ok:true, value}` on success or
+// `{ok:false, reason}` on rejection. Twin entry points are wrappers:
+//   - `validateProfile*(raw)` returns the value or null (silent drop --
+//     used by cleanProfileMetadata for existing base values).
+//   - `takeProfile*(name)` shifts argv and err()s with `bad-{name}-{reason}`
+//     (loud error -- used by the arg parser).
+// Sharing the checker logic keeps the silent-drop and loud-error paths
+// in lockstep (no risk of one being stricter than the other).
+
+function checkProfileString(raw) {
+    if (typeof raw !== 'string' || raw === '') return { ok: false, reason: 'empty' };
+    if (raw.length > MAX_PROFILE_FIELD_LEN) return { ok: false, reason: 'too-long' };
+    const cleaned = sanitizeText(raw).trim();
+    if (!cleaned.length) return { ok: false, reason: 'empty' };
+    return { ok: true, value: cleaned };
+}
+
+function checkProfileHandle(raw) {
+    if (typeof raw !== 'string' || raw === '') return { ok: false, reason: 'empty' };
+    if (raw.length > MAX_PROFILE_FIELD_LEN) return { ok: false, reason: 'too-long' };
+    // Codex r4-simplify: handle fields are identity-tied + cached, so
+    // they get the same canonical-input bar as URL fields. No silent
+    // strip of invisible Unicode -- mismatch with the URL field posture
+    // would be inconsistent.
+    if (sanitizeText(raw) !== raw) return { ok: false, reason: 'format' };
+    if (!NIP05_RE.test(raw)) return { ok: false, reason: 'format' };
+    return { ok: true, value: raw };
+}
+
+// URL fields are strictest (codex r2 P2.1): input MUST be canonical AND
+// parse as URL AND use http(s). No silent strip -- URL fields are
+// signed into the public profile and rendered as clickable links, so
+// smuggling must be rejected outright.
+function checkProfileUrl(raw) {
+    if (typeof raw !== 'string' || raw === '') return { ok: false, reason: 'empty' };
+    if (raw.length > MAX_PROFILE_FIELD_LEN) return { ok: false, reason: 'too-long' };
+    if (sanitizeText(raw) !== raw) return { ok: false, reason: 'format' };
+    if (/[\s\x00-\x1F\x7F]/.test(raw)) return { ok: false, reason: 'format' };
+    let u;
+    try { u = new URL(raw); } catch { return { ok: false, reason: 'format' }; }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return { ok: false, reason: 'scheme' };
+    if (!u.hostname) return { ok: false, reason: 'format' };
+    return { ok: true, value: raw };
+}
+
+// Silent-drop wrappers used by cleanProfileMetadata. Declared as
+// hoisted function declarations because doProfile runs while module
+// top-level is paused on `await` (same TDZ class as the PROFILE_*
+// constants above and the email-sanitize cycle's truncate fix).
+function validateProfileString(v) { const r = checkProfileString(v); return r.ok ? r.value : null; }
+function validateProfileHandle(v) { const r = checkProfileHandle(v); return r.ok ? r.value : null; }
+function validateProfileUrl(v)    { const r = checkProfileUrl(v);    return r.ok ? r.value : null; }
+
+// Re-validate every key in an existing profile blob against the v1 key
+// set + per-field validators. Drops unknown keys, non-string values,
+// invalid URL/string content, pre-existing smuggling, and array-shaped
+// base objects (codex r4-simplify: typeof []==='object', so reject
+// arrays explicitly even though the for-loop would no-op). Codex r1 P2
+// + r2 P2.2: used by BOTH merge-mode set (clean base before re-signing)
+// AND profile get (clean other-pubkey content before emit).
+function cleanProfileMetadata(base) {
+    const out = {};
+    if (!base || typeof base !== 'object' || Array.isArray(base)) return out;
+    for (const key of PROFILE_V1_KEYS) {
+        const raw = base[key];
+        let cleaned = null;
+        if (PROFILE_URL_KEYS.has(key))         cleaned = validateProfileUrl(raw);
+        else if (PROFILE_HANDLE_KEYS.has(key)) cleaned = validateProfileHandle(raw);
+        else if (PROFILE_STRING_KEYS.has(key)) cleaned = validateProfileString(raw);
+        if (cleaned != null) out[key] = cleaned;
+    }
+    return out;
+}
+
+// Loud-error wrappers used by the arg parser. The flag-shaped-value
+// guard (codex r3 P2 -- prevents `--name --replace` consuming the next
+// flag as data) lives ONLY in the arg path; the silent-drop path
+// (cleanProfileMetadata) is for existing-content cleanup where there's
+// no argv source.
+function shiftProfileValue(name) {
+    const raw = args.shift();
+    if (raw == null || raw === '' || raw.startsWith('--')) err(`bad-${name}-empty`);
+    return raw;
+}
+function takeProfileField(name, checker) {
+    const raw = shiftProfileValue(name);
+    const r = checker(raw);
+    if (!r.ok) err(`bad-${name}-${r.reason}`);
+    return r.value;
+}
+// Hoisted function declarations for the same TDZ reason as validate*.
+function takeProfileString(name) { return takeProfileField(name, checkProfileString); }
+function takeProfileHandle(name) { return takeProfileField(name, checkProfileHandle); }
+function takeProfileUrl(name)    { return takeProfileField(name, checkProfileUrl); }
+
+// Replaceable-event collector: gathers every verified matching event
+// from EVERY relay until each settles (EOSE / CLOSED / error / close)
+// or the timer fires, then resolves with the array of {event, relay}
+// pairs. Caller picks the latest per its own ordering. First-wins
+// (raceRelays) is wrong for replaceable events because a stale relay
+// can answer fastest and a fresh relay's later answer would be dropped.
+function collectFromRelays(filter, relays, timeoutMs, perEvent) {
+    return new Promise((resolve) => {
+        if (!relays.length) return resolve([]);
+
+        const out = [];
+        const sockets = [];
+        const relayDone = new Array(relays.length).fill(false);
+        let outstanding = relays.length;
+        let resolvedOnce = false;
+        let timer;
+
+        const finish = () => {
+            if (resolvedOnce) return;
+            resolvedOnce = true;
+            clearTimeout(timer);
+            for (const s of sockets) { try { s.close(); } catch {} }
+            resolve(out);
+        };
+        const settleRelay = (idx) => {
+            if (relayDone[idx]) return;
+            relayDone[idx] = true;
+            if (--outstanding === 0) finish();
+        };
+        timer = setTimeout(finish, timeoutMs);
+
+        relays.forEach((url, idx) => {
+            let ws;
+            try { ws = new WebSocket(url); }
+            catch { settleRelay(idx); return; }
+            sockets.push(ws);
+            const subId = `collect-${randomUUID()}`;
+            ws.on('open', () => {
+                try { ws.send(JSON.stringify(['REQ', subId, filter])); }
+                catch { settleRelay(idx); }
+            });
+            ws.on('message', (raw) => {
+                let msg;
+                try { msg = JSON.parse(raw.toString()); } catch { return; }
+                if (msg[0] === 'EVENT' && msg[1] === subId && msg[2]) {
+                    try { perEvent(msg[2], url, out); } catch { /* keep loop alive */ }
+                } else if ((msg[0] === 'EOSE' && msg[1] === subId) ||
+                           (msg[0] === 'CLOSED' && msg[1] === subId)) {
+                    settleRelay(idx);
+                } else if (msg[0] === 'NOTICE') {
+                    process.stderr.write(`relay-notice url=${url} msg=${truncate(msg[1])}\n`);
+                }
+            });
+            ws.on('error', () => settleRelay(idx));
+            ws.on('close', () => settleRelay(idx));
+        });
+    });
+}
+
+// Resolve the LATEST kind:0 for `authorHex` across `relays`. Returns
+// {event, relay} for the winner (highest created_at, lexicographic id
+// tiebreaker), or null if no relay yielded a verified matching event.
+async function resolveProfile(authorHex, relays, timeoutMs) {
+    const collected = await collectFromRelays(
+        { authors: [authorHex], kinds: [0], limit: 1 },
+        relays,
+        timeoutMs,
+        (ev, url, out) => {
+            if (ev.pubkey !== authorHex) return;
+            if (ev.kind !== 0) return;
+            if (!verifyEvent(ev)) return;
+            out.push({ event: ev, relay: url });
+        },
+    );
+    if (!collected.length) return null;
+    collected.sort((a, b) => {
+        if (b.event.created_at !== a.event.created_at) return b.event.created_at - a.event.created_at;
+        // Lexicographic id tiebreaker for deterministic selection.
+        return a.event.id < b.event.id ? -1 : a.event.id > b.event.id ? 1 : 0;
+    });
+    return collected[0];
+}
+
+async function doProfile() {
+    const sub = args.shift();
+    if (sub === 'set') return doProfileSet();
+    if (sub === 'get') return doProfileGet();
+    err('usage: profile <set|get> ...');
+}
+
+async function doProfileSet() {
+    let replace = false;
+    const fields = {};
+    while (args.length) {
+        const a = args.shift();
+        if      (a === '--replace') replace = true;
+        else if (a === '--name')    fields.name    = takeProfileString('name');
+        else if (a === '--about')   fields.about   = takeProfileString('about');
+        else if (a === '--nip05')   fields.nip05   = takeProfileHandle('nip05');
+        else if (a === '--lud16')   fields.lud16   = takeProfileHandle('lud16');
+        else if (a === '--picture') fields.picture = takeProfileUrl('picture');
+        else if (a === '--banner')  fields.banner  = takeProfileUrl('banner');
+        else if (a === '--website') fields.website = takeProfileUrl('website');
+        else err(`unknown-flag-${a.replace(/^--/, '')}`);
+    }
+    if (!Object.keys(fields).length) err('usage: profile set --name <s> [--about ...] [--replace]');
+
+    const env = loadEnv();
+    if (!env.nsec) err('not-logged-in');
+    let sk;
+    try { sk = decodeNsec(env.nsec); } catch { err('nsec-decode-failed'); }
+    const myHex = getPublicKey(sk);
+
+    const timeoutMs = parseInt(process.env.NOSTR_PROFILE_TIMEOUT_MS || '5000', 10);
+
+    let merged;
+    if (replace) {
+        merged = fields;
+    } else {
+        const existing = await resolveProfile(myHex, env.relays, timeoutMs);
+        let base = {};
+        if (existing) {
+            let parsed = {};
+            try { parsed = JSON.parse(existing.event.content); } catch { /* fall through */ }
+            base = cleanProfileMetadata(parsed);
+        }
+        merged = { ...base, ...fields };
+    }
+
+    const ev = finalizeEvent({
+        kind: 0,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [],
+        content: JSON.stringify(merged),
+    }, sk);
+
+    const ok = await publishOneShot(ev, env.relays, timeoutMs);
+    if (!ok) err('publish-failed');
+
+    process.stdout.write(JSON.stringify({
+        ok: true,
+        id: ev.id,
+        npub: nip19.npubEncode(myHex),
+        profile: merged,
+    }) + '\n');
+}
+
+async function doProfileGet() {
+    const env = loadEnv();
+    let targetHex;
+    const arg = args.shift();
+    if (!arg) {
+        if (!env.nsec) err('not-logged-in');
+        let sk;
+        try { sk = decodeNsec(env.nsec); } catch { err('nsec-decode-failed'); }
+        targetHex = getPublicKey(sk);
+    } else {
+        try { targetHex = decodeNpub(arg); } catch { err('bad-target-npub'); }
+    }
+
+    const timeoutMs = parseInt(process.env.NOSTR_PROFILE_TIMEOUT_MS || '5000', 10);
+    const result = await resolveProfile(targetHex, env.relays, timeoutMs);
+    if (!result) err('profile-not-found');
+
+    let parsed = {};
+    try { parsed = JSON.parse(result.event.content); } catch { /* fall through */ }
+    const cleaned = cleanProfileMetadata(parsed);
+
+    process.stdout.write(JSON.stringify({
+        npub: nip19.npubEncode(targetHex),
+        pubkey: targetHex,
+        created_at: result.event.created_at,
+        content: cleaned,
+    }) + '\n');
+}
+
 // ── help ──
 
 function doHelp() {
@@ -692,6 +991,8 @@ function doHelp() {
             'send <npub> <body>',
             'search [--tag <topic>] [--kind n] [--limit n] [--since 7d] [--author <npub>] [<keyword>]',
             'reply <parent-event-id> <body>',
+            'profile set [--name s] [--about s] [--picture url] [--banner url] [--nip05 s] [--lud16 s] [--website url] [--replace]',
+            'profile get [<npub>]',
             'whoami',
             'help',
         ],
