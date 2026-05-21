@@ -144,6 +144,12 @@ const PROFILE_V1_KEYS = [...PROFILE_STRING_KEYS, ...PROFILE_HANDLE_KEYS, ...PROF
 const NIP05_RE = /^[A-Za-z0-9_.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
 const MAX_PROFILE_FIELD_LEN = 500;
 
+// Follow (kind:3 contact list) limits. Declared here for the same TDZ
+// reason as the PROFILE_* block: follow handlers run while module
+// top-level is paused on its await dispatch.
+const MAX_PETNAME_LEN = 100;
+const MAX_RELAY_URL_LEN = 200;
+
 function parseRelayList(s) {
     if (!s) return undefined;
     const out = String(s).split(',').map(x => x.trim()).filter(Boolean);
@@ -318,6 +324,7 @@ switch (cmd) {
     case 'search': await doSearch(); break;
     case 'reply':  await doReply(); break;
     case 'profile': await doProfile(); break;
+    case 'follow':  await doFollow(); break;
     case 'whoami': doWhoami(); break;
     case 'help': case '--help': case '-h': default: doHelp(); break;
 }
@@ -865,14 +872,19 @@ function collectFromRelays(filter, relays, timeoutMs, perEvent) {
 // Resolve the LATEST kind:0 for `authorHex` across `relays`. Returns
 // {event, relay} for the winner (highest created_at, lexicographic id
 // tiebreaker), or null if no relay yielded a verified matching event.
-async function resolveProfile(authorHex, relays, timeoutMs) {
+// Resolve the LATEST replaceable event of `kind` for `authorHex` across
+// `relays`. Verified-sig + pubkey-match + kind-match gating. Highest
+// `created_at` wins, lexicographic `id` tiebreaker for deterministic
+// selection. Returns {event, relay} or null. Shared by resolveProfile
+// (kind:0) and resolveContactList (kind:3).
+async function resolveLatestReplaceable(authorHex, kind, relays, timeoutMs) {
     const collected = await collectFromRelays(
-        { authors: [authorHex], kinds: [0], limit: 1 },
+        { authors: [authorHex], kinds: [kind], limit: 1 },
         relays,
         timeoutMs,
         (ev, url, out) => {
             if (ev.pubkey !== authorHex) return;
-            if (ev.kind !== 0) return;
+            if (ev.kind !== kind) return;
             if (!verifyEvent(ev)) return;
             out.push({ event: ev, relay: url });
         },
@@ -880,10 +892,13 @@ async function resolveProfile(authorHex, relays, timeoutMs) {
     if (!collected.length) return null;
     collected.sort((a, b) => {
         if (b.event.created_at !== a.event.created_at) return b.event.created_at - a.event.created_at;
-        // Lexicographic id tiebreaker for deterministic selection.
         return a.event.id < b.event.id ? -1 : a.event.id > b.event.id ? 1 : 0;
     });
     return collected[0];
+}
+
+function resolveProfile(authorHex, relays, timeoutMs) {
+    return resolveLatestReplaceable(authorHex, 0, relays, timeoutMs);
 }
 
 async function doProfile() {
@@ -979,6 +994,236 @@ async function doProfileGet() {
     }) + '\n');
 }
 
+// ── follow: read/write NIP-02 kind:3 contact list ──
+//
+// kind:3 is a replaceable event whose `tags` array lists every pubkey
+// the agent follows: `["p", pubkey_hex, relay_hint?, petname?]` per
+// entry. Replaceable: latest wins on relays, but old versions stay
+// cached in clients (same softer permanence as kind:0 profile).
+//
+// All function declarations (not const arrows) so they're hoisted past
+// the await doX() dispatch above and don't TDZ-trap at call time.
+
+function checkRelayUrl(raw) {
+    if (typeof raw !== 'string' || raw === '') return { ok: false, reason: 'empty' };
+    if (raw.length > MAX_RELAY_URL_LEN) return { ok: false, reason: 'too-long' };
+    if (sanitizeText(raw) !== raw) return { ok: false, reason: 'format' };
+    if (/[\s\x00-\x1F\x7F]/.test(raw)) return { ok: false, reason: 'format' };
+    let u;
+    try { u = new URL(raw); } catch { return { ok: false, reason: 'format' }; }
+    if (u.protocol !== 'wss:' && u.protocol !== 'ws:') return { ok: false, reason: 'scheme' };
+    if (!u.hostname) return { ok: false, reason: 'format' };
+    return { ok: true, value: raw };
+}
+
+function checkPetname(raw) {
+    if (typeof raw !== 'string' || raw === '') return { ok: false, reason: 'empty' };
+    if (raw.length > MAX_PETNAME_LEN) return { ok: false, reason: 'too-long' };
+    if (sanitizeText(raw) !== raw) return { ok: false, reason: 'format' };
+    return { ok: true, value: raw };
+}
+
+// Silent-drop wrappers for existing tag content from a parsed kind:3.
+function validateRelayUrl(v) { const r = checkRelayUrl(v); return r.ok ? r.value : ''; }
+function validatePetname(v)  { const r = checkPetname(v);  return r.ok ? r.value : ''; }
+
+// Loud-error wrappers for arg-parser input. Reuse shiftProfileValue
+// to get the "value must not be a flag-shaped token" guard.
+function takeRelayUrl(name) {
+    const raw = shiftProfileValue(name);
+    const r = checkRelayUrl(raw);
+    if (!r.ok) err(`bad-${name}-${r.reason}`);
+    return r.value;
+}
+function takePetname(name) {
+    const raw = shiftProfileValue(name);
+    const r = checkPetname(raw);
+    if (!r.ok) err(`bad-${name}-${r.reason}`);
+    return r.value;
+}
+
+// Parse a kind:3 tags array into a Map<pubkeyHex, {relay, petname}>.
+// O(1) upsert/remove, automatic dedup of malformed duplicates (first
+// occurrence wins). Drops every non-`p` tag, every p-tag with a
+// malformed pubkey, and any relay/petname value that fails its
+// validator (silent-drop to empty string -- the entry survives but
+// the bad value doesn't).
+function parseContactList(tags) {
+    const out = new Map();
+    if (!Array.isArray(tags)) return out;
+    for (const t of tags) {
+        if (!Array.isArray(t) || t[0] !== 'p') continue;
+        const pk = normHexId(t[1]);
+        if (!pk) continue;
+        if (out.has(pk)) continue;
+        out.set(pk, {
+            relay: validateRelayUrl(t[2]),
+            petname: validatePetname(t[3]),
+        });
+    }
+    return out;
+}
+
+// Re-emit a contacts Map as the canonical NIP-02 4-field tag array.
+function contactsToTags(contacts) {
+    return [...contacts.entries()].map(([pk, v]) => ['p', pk, v.relay || '', v.petname || '']);
+}
+
+// Resolve the latest kind:3 for `authorHex` across `relays`. Replaceable
+// event -- use the collector (highest created_at wins, lexicographic id
+// tiebreaker), not first-wins. Built on collectFromRelays.
+function resolveContactList(authorHex, relays, timeoutMs) {
+    return resolveLatestReplaceable(authorHex, 3, relays, timeoutMs);
+}
+
+async function doFollow() {
+    const sub = args.shift();
+    if (sub === 'add')    return doFollowAdd();
+    if (sub === 'remove') return doFollowRemove();
+    if (sub === 'list')   return doFollowList();
+    err('usage: follow <add|remove|list> ...');
+}
+
+async function doFollowAdd() {
+    // Required positional first.
+    const npubArg = args.shift();
+    let targetHex;
+    try { targetHex = decodeNpub(npubArg); } catch { err('bad-target-npub'); }
+
+    // Optional flags. Track which were explicitly provided for per-field
+    // merge (codex r1 P2.1). Each at most once -- duplicate -> error.
+    let relayValue = null, petnameValue = null;
+    while (args.length && args[0].startsWith('--')) {
+        const flag = args.shift();
+        if (flag === '--relay') {
+            if (relayValue !== null) err('duplicate-flag-relay');
+            relayValue = takeRelayUrl('relay');
+        } else if (flag === '--petname') {
+            if (petnameValue !== null) err('duplicate-flag-petname');
+            petnameValue = takePetname('petname');
+        } else {
+            err(`unknown-flag-${flag.replace(/^--/, '')}`);
+        }
+    }
+    if (args.length) err('unexpected-extra-args');
+
+    const env = loadEnv();
+    if (!env.nsec) err('not-logged-in');
+    let sk;
+    try { sk = decodeNsec(env.nsec); } catch { err('nsec-decode-failed'); }
+    const myHex = getPublicKey(sk);
+
+    if (targetHex === myHex) err('cannot-follow-self');
+
+    const timeoutMs = parseInt(process.env.NOSTR_FOLLOW_TIMEOUT_MS || '5000', 10);
+    const existing = await resolveContactList(myHex, env.relays, timeoutMs);
+    const contacts = parseContactList(existing?.event?.tags || []);
+
+    // Strip any pre-existing self-follow another client wrote (codex r2
+    // P2). Our CLI must never re-sign a self-follow.
+    contacts.delete(myHex);
+
+    // Per-field merge.
+    const prev = contacts.get(targetHex);
+    const newRow = {
+        relay:   relayValue   !== null ? relayValue   : (prev?.relay   ?? ''),
+        petname: petnameValue !== null ? petnameValue : (prev?.petname ?? ''),
+    };
+    contacts.set(targetHex, newRow);
+
+    const ev = finalizeEvent({
+        kind: 3,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: contactsToTags(contacts),
+        content: '',
+    }, sk);
+    const ok = await publishOneShot(ev, env.relays, timeoutMs);
+    if (!ok) err('publish-failed');
+
+    process.stdout.write(JSON.stringify({
+        ok: true,
+        id: ev.id,
+        npub: nip19.npubEncode(myHex),
+        target: nip19.npubEncode(targetHex),
+        contacts: contacts.size,
+        action: prev ? 'updated' : 'added',
+    }) + '\n');
+}
+
+async function doFollowRemove() {
+    const npubArg = args.shift();
+    let targetHex;
+    try { targetHex = decodeNpub(npubArg); } catch { err('bad-target-npub'); }
+    if (args.length) err('unexpected-extra-args');
+
+    const env = loadEnv();
+    if (!env.nsec) err('not-logged-in');
+    let sk;
+    try { sk = decodeNsec(env.nsec); } catch { err('nsec-decode-failed'); }
+    const myHex = getPublicKey(sk);
+
+    const timeoutMs = parseInt(process.env.NOSTR_FOLLOW_TIMEOUT_MS || '5000', 10);
+    const existing = await resolveContactList(myHex, env.relays, timeoutMs);
+    const contacts = parseContactList(existing?.event?.tags || []);
+
+    contacts.delete(myHex);  // strip pre-existing self-follow (codex r2 P2)
+
+    if (!contacts.has(targetHex)) err('not-following');
+    contacts.delete(targetHex);
+
+    const ev = finalizeEvent({
+        kind: 3,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: contactsToTags(contacts),
+        content: '',
+    }, sk);
+    const ok = await publishOneShot(ev, env.relays, timeoutMs);
+    if (!ok) err('publish-failed');
+
+    process.stdout.write(JSON.stringify({
+        ok: true,
+        id: ev.id,
+        npub: nip19.npubEncode(myHex),
+        target: nip19.npubEncode(targetHex),
+        contacts: contacts.size,
+        action: 'removed',
+    }) + '\n');
+}
+
+async function doFollowList() {
+    const env = loadEnv();
+    let targetHex;
+    const arg = args.shift();
+    if (!arg) {
+        if (!env.nsec) err('not-logged-in');
+        let sk;
+        try { sk = decodeNsec(env.nsec); } catch { err('nsec-decode-failed'); }
+        targetHex = getPublicKey(sk);
+    } else {
+        try { targetHex = decodeNpub(arg); } catch { err('bad-target-npub'); }
+    }
+    if (args.length) err('unexpected-extra-args');
+
+    const timeoutMs = parseInt(process.env.NOSTR_FOLLOW_TIMEOUT_MS || '5000', 10);
+    const result = await resolveContactList(targetHex, env.relays, timeoutMs);
+    if (!result) err('contact-list-not-found');
+
+    const contacts = parseContactList(result.event.tags);
+    const out = [...contacts.entries()].map(([pk, v]) => {
+        const entry = { npub: nip19.npubEncode(pk), pubkey: pk };
+        if (v.relay)   entry.relay   = v.relay;
+        if (v.petname) entry.petname = v.petname;
+        return entry;
+    });
+
+    process.stdout.write(JSON.stringify({
+        npub: nip19.npubEncode(targetHex),
+        pubkey: targetHex,
+        created_at: result.event.created_at,
+        contacts: out,
+    }) + '\n');
+}
+
 // ── help ──
 
 function doHelp() {
@@ -993,6 +1238,9 @@ function doHelp() {
             'reply <parent-event-id> <body>',
             'profile set [--name s] [--about s] [--picture url] [--banner url] [--nip05 s] [--lud16 s] [--website url] [--replace]',
             'profile get [<npub>]',
+            'follow add <npub> [--petname s] [--relay wss-url]',
+            'follow remove <npub>',
+            'follow list [<npub>]',
             'whoami',
             'help',
         ],

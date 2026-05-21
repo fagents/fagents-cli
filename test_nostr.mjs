@@ -683,12 +683,14 @@ function signNote(sk, content, tags = []) {
 // a stray dev shell var would silently route mock-relay tests to an
 // external relay. Tests that exercise process-env precedence opt in by
 // passing { NOSTR_SEARCH_RELAYS: '...' } in the env arg.
-function runSearch(args, env = {}) {
+//
+// All runX(...) wrappers share this shape; spawnCli is the internal.
+function spawnCli(subcommand, cmdArgs, env, timeoutEnvKey, timeoutMs) {
     return new Promise((resolve) => {
-        const childEnv = { ...process.env, NOSTR_SEARCH_TIMEOUT_MS: '2000' };
+        const childEnv = { ...process.env, [timeoutEnvKey]: String(timeoutMs) };
         delete childEnv.NOSTR_SEARCH_RELAYS;
         Object.assign(childEnv, env);
-        const proc = spawn('node', [CLI, ...baseFlags, 'search', ...args], {
+        const proc = spawn('node', [CLI, ...baseFlags, subcommand, ...cmdArgs], {
             stdio: ['ignore', 'pipe', 'pipe'],
             env: childEnv,
         });
@@ -699,6 +701,10 @@ function runSearch(args, env = {}) {
             resolve({ stdout: stdout.trim(), stderr: stderr.trim(), status: code || 0 });
         });
     });
+}
+
+function runSearch(args, env = {}) {
+    return spawnCli('search', args, env, 'NOSTR_SEARCH_TIMEOUT_MS', 2000);
 }
 
 const skNoter = generateSecretKey();
@@ -951,16 +957,17 @@ const pkNoter = getPublicKey(skNoter);
 
 console.log('\nReply:');
 
-// replyMockRelay: serves a configured event on REQ (regardless of filter),
-// optionally OKs the publish EVENT, records published events for assertion.
-// `silent: true` makes the relay accept connections but never send anything --
-// used by the multi-relay hang regression.
-async function replyMockRelay(port, eventToServe, { okPublish = true, silent = false } = {}) {
+// captureMockRelay: shared internal for the three "serve a configured
+// event on REQ + capture published events on EVENT" mocks (reply,
+// profile, follow). Each public wrapper passes its expected publish
+// `kind` (1, 0, or 3) so the EVENT capture only catches the kind it
+// cares about; other kinds are ignored.
+async function captureMockRelay(port, publishKind, eventToServe, { okPublish = true, silent = false } = {}) {
     const wss = new WebSocketServer({ port });
-    const published = [];   // events captured from EVENT frames
-    const recvReqs = [];    // REQ filters captured
+    const published = [];
+    const recvReqs = [];
     wss.on('connection', (ws) => {
-        if (silent) return;   // accept conn, never respond
+        if (silent) return;
         ws.on('message', (raw) => {
             let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
             if (msg[0] === 'REQ') {
@@ -969,7 +976,7 @@ async function replyMockRelay(port, eventToServe, { okPublish = true, silent = f
                     try { ws.send(JSON.stringify(['EVENT', msg[1], eventToServe])); } catch {}
                 }
                 try { ws.send(JSON.stringify(['EOSE', msg[1]])); } catch {}
-            } else if (msg[0] === 'EVENT' && msg[1] && msg[1].kind === 1) {
+            } else if (msg[0] === 'EVENT' && msg[1] && msg[1].kind === publishKind) {
                 published.push(msg[1]);
                 try { ws.send(JSON.stringify(['OK', msg[1].id, okPublish, okPublish ? '' : 'test-reject'])); } catch {}
             }
@@ -978,22 +985,14 @@ async function replyMockRelay(port, eventToServe, { okPublish = true, silent = f
     return { port, published, recvReqs, close: () => wss.close() };
 }
 
+// Wrappers: feature-specific names + the right publish kind. Keep the
+// public signature each test currently calls.
+function replyMockRelay(port, eventToServe, opts = {}) {
+    return captureMockRelay(port, 1, eventToServe, opts);
+}
+
 function runReply(args, env = {}) {
-    return new Promise((resolve) => {
-        const childEnv = { ...process.env, NOSTR_REPLY_TIMEOUT_MS: '2000' };
-        delete childEnv.NOSTR_SEARCH_RELAYS;
-        Object.assign(childEnv, env);
-        const proc = spawn('node', [CLI, ...baseFlags, 'reply', ...args], {
-            stdio: ['ignore', 'pipe', 'pipe'],
-            env: childEnv,
-        });
-        let stdout = '', stderr = '';
-        proc.stdout.on('data', (d) => { stdout += d.toString(); });
-        proc.stderr.on('data', (d) => { stderr += d.toString(); });
-        proc.on('close', (code) => {
-            resolve({ stdout: stdout.trim(), stderr: stderr.trim(), status: code || 0 });
-        });
-    });
+    return spawnCli('reply', args, env, 'NOSTR_REPLY_TIMEOUT_MS', 2000);
 }
 
 // Shared identity for the reply path tests. login generates nsec into env.
@@ -1335,45 +1334,12 @@ console.log('\nProfile:');
 // profileMockRelay: serves a configured kind:0 (or none) in response to
 // REQ with authors filter; captures published kind:0 events on EVENT,
 // OKs them by default.
-async function profileMockRelay(port, kind0Event, { okPublish = true, silent = false } = {}) {
-    const wss = new WebSocketServer({ port });
-    const published = [];
-    const recvReqs = [];
-    wss.on('connection', (ws) => {
-        if (silent) return;
-        ws.on('message', (raw) => {
-            let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
-            if (msg[0] === 'REQ') {
-                recvReqs.push({ sid: msg[1], filter: msg[2] });
-                if (kind0Event) {
-                    try { ws.send(JSON.stringify(['EVENT', msg[1], kind0Event])); } catch {}
-                }
-                try { ws.send(JSON.stringify(['EOSE', msg[1]])); } catch {}
-            } else if (msg[0] === 'EVENT' && msg[1] && msg[1].kind === 0) {
-                published.push(msg[1]);
-                try { ws.send(JSON.stringify(['OK', msg[1].id, okPublish, okPublish ? '' : 'test-reject'])); } catch {}
-            }
-        });
-    });
-    return { port, published, recvReqs, close: () => wss.close() };
+function profileMockRelay(port, kind0Event, opts = {}) {
+    return captureMockRelay(port, 0, kind0Event, opts);
 }
 
 function runProfile(args, env = {}) {
-    return new Promise((resolve) => {
-        const childEnv = { ...process.env, NOSTR_PROFILE_TIMEOUT_MS: '1500' };
-        delete childEnv.NOSTR_SEARCH_RELAYS;
-        Object.assign(childEnv, env);
-        const proc = spawn('node', [CLI, ...baseFlags, 'profile', ...args], {
-            stdio: ['ignore', 'pipe', 'pipe'],
-            env: childEnv,
-        });
-        let stdout = '', stderr = '';
-        proc.stdout.on('data', (d) => { stdout += d.toString(); });
-        proc.stderr.on('data', (d) => { stderr += d.toString(); });
-        proc.on('close', (code) => {
-            resolve({ stdout: stdout.trim(), stderr: stderr.trim(), status: code || 0 });
-        });
-    });
+    return spawnCli('profile', args, env, 'NOSTR_PROFILE_TIMEOUT_MS', 1500);
 }
 
 // Reuse the existing nsec written by the reply tests' login() call.
@@ -1737,6 +1703,489 @@ function pointEnvToRelays(...urls) {
     assertJsonField(res.stdout, 'error', 'profile-not-found', '95: no events -> profile-not-found');
     r.close();
 }
+
+// ── 96-130: nostr.mjs follow (NIP-02 kind:3) ──
+
+console.log('\nFollow:');
+
+// followMockRelay: serves a configured kind:3 (or none) in response to
+// REQ with authors filter; captures published kind:3 events on EVENT,
+// OKs them by default.
+function followMockRelay(port, kind3Event, opts = {}) {
+    return captureMockRelay(port, 3, kind3Event, opts);
+}
+
+function runFollow(args, env = {}) {
+    return spawnCli('follow', args, env, 'NOSTR_FOLLOW_TIMEOUT_MS', 1500);
+}
+
+function signKind3(sk, tagsArray, createdAt) {
+    return finalizeEvent({
+        kind: 3,
+        created_at: createdAt ?? Math.floor(Date.now() / 1000),
+        tags: tagsArray,
+        content: '',
+    }, sk);
+}
+
+// Helpers to produce target/decoy npubs deterministically for the
+// follow tests. ownSk + ownPk derived earlier from the test env.
+const followTargetSk = generateSecretKey();
+const followTargetPk = getPublicKey(followTargetSk);
+const followTargetNpub = nip19.npubEncode(followTargetPk);
+
+const otherFollowSk = generateSecretKey();
+const otherFollowPk = getPublicKey(otherFollowSk);
+const otherFollowNpub = nip19.npubEncode(otherFollowPk);
+
+const decoyFollowSk = generateSecretKey();
+const decoyFollowPk = getPublicKey(decoyFollowSk);
+
+// 96: add first follow on an empty list
+{
+    const port = 40000 + Math.floor(Math.random() * 50);
+    const r = await followMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['add', followTargetNpub]);
+    assertEq(0, res.status, '96a: add to empty list exits 0');
+    const out = JSON.parse(res.stdout);
+    assertEq('added', out.action, '96b: action=added on new');
+    assertEq(1, out.contacts, '96c: contacts count 1');
+    const published = r.published[0];
+    assertEq(1, published.tags.length, '96d: published kind:3 has 1 tag');
+    assertEq(followTargetPk, published.tags[0][1], '96e: target pubkey present');
+    assertEq('', published.tags[0][2], '96f: empty relay slot');
+    assertEq('', published.tags[0][3], '96g: empty petname slot');
+    r.close();
+}
+
+// 97: add with --petname and --relay
+{
+    const port = 40050 + Math.floor(Math.random() * 50);
+    const r = await followMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['add', followTargetNpub, '--petname', 'Target', '--relay', 'wss://r.example']);
+    assertEq(0, res.status, '97a: add with flags exits 0');
+    const published = r.published[0];
+    assertEq('wss://r.example', published.tags[0][2], '97b: relay in tag');
+    assertEq('Target', published.tags[0][3], '97c: petname in tag');
+    r.close();
+}
+
+// 98: add when already following updates instead of duplicating
+{
+    const port = 40100 + Math.floor(Math.random() * 50);
+    const existing = signKind3(ownSk, [['p', followTargetPk, 'wss://old.example', 'OldName']]);
+    const r = await followMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['add', followTargetNpub, '--petname', 'NewName', '--relay', 'wss://new.example']);
+    const out = JSON.parse(res.stdout);
+    assertEq('updated', out.action, '98a: action=updated on existing');
+    assertEq(1, out.contacts, '98b: still 1 contact (no duplicate)');
+    const published = r.published[0];
+    assertEq(1, published.tags.length, '98c: still 1 tag');
+    assertEq('wss://new.example', published.tags[0][2], '98d: relay updated');
+    assertEq('NewName', published.tags[0][3], '98e: petname updated');
+    r.close();
+}
+
+// 99: per-field merge -- re-add with NO flags preserves both fields (codex r1 P2.1)
+{
+    const port = 40150 + Math.floor(Math.random() * 50);
+    const existing = signKind3(ownSk, [['p', followTargetPk, 'wss://preserve.example', 'Alice']]);
+    const r = await followMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    await runFollow(['add', followTargetNpub]);
+    const published = r.published[0];
+    assertEq('wss://preserve.example', published.tags[0][2], '99a: relay preserved when no --relay');
+    assertEq('Alice', published.tags[0][3], '99b: petname preserved when no --petname');
+    r.close();
+}
+
+// 100: per-field merge -- only --petname preserves relay
+{
+    const port = 40200 + Math.floor(Math.random() * 50);
+    const existing = signKind3(ownSk, [['p', followTargetPk, 'wss://keep.example', 'Alice']]);
+    const r = await followMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    await runFollow(['add', followTargetNpub, '--petname', 'Bob']);
+    const published = r.published[0];
+    assertEq('wss://keep.example', published.tags[0][2], '100a: relay preserved');
+    assertEq('Bob', published.tags[0][3], '100b: petname updated');
+    r.close();
+}
+
+// 101: per-field merge -- only --relay preserves petname
+{
+    const port = 40250 + Math.floor(Math.random() * 50);
+    const existing = signKind3(ownSk, [['p', followTargetPk, 'wss://old.example', 'KeepName']]);
+    const r = await followMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    await runFollow(['add', followTargetNpub, '--relay', 'wss://new.example']);
+    const published = r.published[0];
+    assertEq('wss://new.example', published.tags[0][2], '101a: relay updated');
+    assertEq('KeepName', published.tags[0][3], '101b: petname preserved');
+    r.close();
+}
+
+// 102: merge preserves other follows
+{
+    const port = 40300 + Math.floor(Math.random() * 50);
+    const existing = signKind3(ownSk, [
+        ['p', otherFollowPk, '', 'Other'],
+    ]);
+    const r = await followMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    await runFollow(['add', followTargetNpub]);
+    const published = r.published[0];
+    assertEq(2, published.tags.length, '102a: both follows present');
+    const pks = published.tags.map(t => t[1]).sort();
+    assertTrue(pks.includes(otherFollowPk), '102b: prior follow preserved');
+    assertTrue(pks.includes(followTargetPk), '102c: new follow added');
+    r.close();
+}
+
+// 103: latest-wins on add merge base (older relay vs newer relay)
+{
+    const portA = 40350 + Math.floor(Math.random() * 25);
+    const portB = 40375 + Math.floor(Math.random() * 25);
+    const now = Math.floor(Date.now() / 1000);
+    const older = signKind3(ownSk, [['p', otherFollowPk, '', 'IGNORED']], now - 3600);
+    const newer = signKind3(ownSk, [['p', otherFollowPk, '', 'KeepNew']], now);
+    const rA = await followMockRelay(portA, older);
+    const rB = await followMockRelay(portB, newer);
+    pointEnvToRelays(`ws://127.0.0.1:${portA}`, `ws://127.0.0.1:${portB}`);
+    await runFollow(['add', followTargetNpub]);
+    const pub = rA.published[0] || rB.published[0];
+    const otherEntry = pub.tags.find(t => t[1] === otherFollowPk);
+    assertEq('KeepNew', otherEntry[3], '103: merge base is the NEWER kind:3');
+    rA.close(); rB.close();
+}
+
+// 104: self-follow rejected at the gate
+{
+    const port = 40450 + Math.floor(Math.random() * 50);
+    const r = await followMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const ownNpub = nip19.npubEncode(ownPk_DERIVED());
+    const res = await runFollow(['add', ownNpub]);
+    assertJsonField(res.stdout, 'error', 'cannot-follow-self', '104a: self-follow rejected');
+    assertEq(0, r.published.length, '104b: nothing published when self-follow attempted');
+    r.close();
+}
+
+// 105: bad target npub
+{
+    const res = await runFollow(['add', 'not-a-real-npub']);
+    assertJsonField(res.stdout, 'error', 'bad-target-npub', '105: bad-target-npub');
+}
+
+// 106: bad relay scheme (http://)
+{
+    const port = 40550 + Math.floor(Math.random() * 50);
+    const r = await followMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['add', followTargetNpub, '--relay', 'http://example.com']);
+    assertJsonField(res.stdout, 'error', 'bad-relay-scheme', '106: bad-relay-scheme');
+    r.close();
+}
+
+// 107: bad relay format (whitespace / control / invisible Unicode)
+{
+    const port = 40600 + Math.floor(Math.random() * 50);
+    const r = await followMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const cases = [
+        { args: ['add', followTargetNpub, '--relay', 'wss://exa mple.com'], code: 'bad-relay-format', label: '107a: whitespace' },
+        { args: ['add', followTargetNpub, '--relay', 'wss://example.com/\u{E0065}'], code: 'bad-relay-format', label: '107b: invisible Unicode' },
+    ];
+    for (const c of cases) {
+        const res = await runFollow(c.args);
+        assertJsonField(res.stdout, 'error', c.code, c.label);
+    }
+    r.close();
+}
+
+// 108: oversized petname
+{
+    const port = 40650 + Math.floor(Math.random() * 50);
+    const r = await followMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['add', followTargetNpub, '--petname', 'x'.repeat(101)]);
+    assertJsonField(res.stdout, 'error', 'bad-petname-too-long', '108: oversized petname');
+    r.close();
+}
+
+// 109: petname with smuggled Unicode (canonical bar)
+{
+    const port = 40700 + Math.floor(Math.random() * 50);
+    const r = await followMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['add', followTargetNpub, '--petname', 'Alice\u{200B}']);
+    assertJsonField(res.stdout, 'error', 'bad-petname-format', '109: smuggled-Unicode petname rejected');
+    r.close();
+}
+
+// 110: parser hardening on add -- --petname --relay <foo> (no petname value)
+{
+    const port = 40750 + Math.floor(Math.random() * 50);
+    const r = await followMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['add', followTargetNpub, '--petname', '--relay', 'wss://x.example']);
+    assertJsonField(res.stdout, 'error', 'bad-petname-empty', '110: --petname --relay rejects as bad-petname-empty');
+    assertEq(0, r.published.length, '110b: nothing published');
+    r.close();
+}
+
+// 111: strict argv on add -- extra trailing positional (codex r1 P2.2)
+{
+    const port = 40800 + Math.floor(Math.random() * 50);
+    const r = await followMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['add', followTargetNpub, 'extra-token']);
+    assertJsonField(res.stdout, 'error', 'unexpected-extra-args', '111a: trailing positional rejected');
+    assertEq(0, r.published.length, '111b: nothing published when extras present');
+    r.close();
+}
+
+// 112: strict argv -- duplicate --petname
+{
+    const port = 40850 + Math.floor(Math.random() * 50);
+    const r = await followMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['add', followTargetNpub, '--petname', 'A', '--petname', 'B']);
+    assertJsonField(res.stdout, 'error', 'duplicate-flag-petname', '112: duplicate --petname rejected');
+    r.close();
+}
+
+// 113: pre-existing self-follow stripped on add (codex r2 P2)
+{
+    const port = 40900 + Math.floor(Math.random() * 50);
+    const ownPk = ownPk_DERIVED();
+    const existing = signKind3(ownSk, [
+        ['p', ownPk, '', 'me'],   // self-follow from prior client
+        ['p', otherFollowPk, '', 'Other'],
+    ]);
+    const r = await followMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    await runFollow(['add', followTargetNpub]);
+    const published = r.published[0];
+    const pks = published.tags.map(t => t[1]);
+    assertTrue(pks.includes(followTargetPk), '113a: new follow added');
+    assertTrue(pks.includes(otherFollowPk), '113b: existing other follow preserved');
+    assertTrue(!pks.includes(ownPk), '113c: pre-existing self-follow stripped on re-sign');
+    r.close();
+}
+
+// 114-116: remove
+{
+    // 114: remove existing follow
+    const port = 40950 + Math.floor(Math.random() * 25);
+    const existing = signKind3(ownSk, [
+        ['p', followTargetPk, '', 'Target'],
+        ['p', otherFollowPk, '', 'Other'],
+    ]);
+    const r = await followMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['remove', followTargetNpub]);
+    const out = JSON.parse(res.stdout);
+    assertEq('removed', out.action, '114a: action=removed');
+    assertEq(1, out.contacts, '114b: 1 follow left');
+    const published = r.published[0];
+    assertEq(1, published.tags.length, '114c: 1 tag remaining');
+    assertEq(otherFollowPk, published.tags[0][1], '114d: other preserved, target gone');
+    r.close();
+}
+
+// 115: remove when not following
+{
+    const port = 40975 + Math.floor(Math.random() * 25);
+    const existing = signKind3(ownSk, [['p', otherFollowPk, '', 'Other']]);
+    const r = await followMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['remove', followTargetNpub]);
+    assertJsonField(res.stdout, 'error', 'not-following', '115a: not-following errored');
+    assertEq(0, r.published.length, '115b: nothing published');
+    r.close();
+}
+
+// 116: strict argv on remove (codex r1 P2.2)
+{
+    const port = 41000 + Math.floor(Math.random() * 25);
+    const existing = signKind3(ownSk, [['p', followTargetPk, '', 'X']]);
+    const r = await followMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['remove', followTargetNpub, 'extra']);
+    assertJsonField(res.stdout, 'error', 'unexpected-extra-args', '116a: trailing arg on remove rejected');
+    assertEq(0, r.published.length, '116b: nothing published');
+    r.close();
+}
+
+// 117: remove rejects flags
+{
+    const port = 41025 + Math.floor(Math.random() * 25);
+    const existing = signKind3(ownSk, [['p', followTargetPk, '', 'X']]);
+    const r = await followMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['remove', followTargetNpub, '--petname', 'X']);
+    // The --petname token survives to the unexpected-extra-args check.
+    assertJsonField(res.stdout, 'error', 'unexpected-extra-args', '117: --flag rejected on remove');
+    r.close();
+}
+
+// 118: pre-existing self-follow stripped on remove (codex r2 P2)
+{
+    const port = 41050 + Math.floor(Math.random() * 25);
+    const ownPk = ownPk_DERIVED();
+    const existing = signKind3(ownSk, [
+        ['p', ownPk, '', 'me'],
+        ['p', followTargetPk, '', 'Target'],
+        ['p', otherFollowPk, '', 'Other'],
+    ]);
+    const r = await followMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    await runFollow(['remove', followTargetNpub]);
+    const published = r.published[0];
+    const pks = published.tags.map(t => t[1]);
+    assertEq(1, published.tags.length, '118a: exactly 1 tag remaining');
+    assertEq(otherFollowPk, pks[0], '118b: only other-follow remains -- target removed, self-follow stripped');
+    r.close();
+}
+
+// 119-126: list
+// 119: list own with empty kind:3
+{
+    const port = 41100 + Math.floor(Math.random() * 25);
+    const existing = signKind3(ownSk, []);
+    const r = await followMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['list']);
+    const out = JSON.parse(res.stdout);
+    assertEq(0, out.contacts.length, '119: empty kind:3 returns empty contacts array');
+    r.close();
+}
+
+// 120: list returns entries with relay+petname when present
+{
+    const port = 41125 + Math.floor(Math.random() * 25);
+    const existing = signKind3(ownSk, [
+        ['p', followTargetPk, 'wss://r.example', 'Alice'],
+        ['p', otherFollowPk, '', ''],
+    ]);
+    const r = await followMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['list']);
+    const out = JSON.parse(res.stdout);
+    assertEq(2, out.contacts.length, '120a: two entries');
+    const alice = out.contacts.find(c => c.pubkey === followTargetPk);
+    assertEq('wss://r.example', alice.relay, '120b: alice relay returned');
+    assertEq('Alice', alice.petname, '120c: alice petname returned');
+    const other = out.contacts.find(c => c.pubkey === otherFollowPk);
+    assertTrue(!('relay' in other), '120d: empty relay omitted from output');
+    assertTrue(!('petname' in other), '120e: empty petname omitted from output');
+    r.close();
+}
+
+// 121: list drops malformed entries from other-npub kind:3
+{
+    const port = 41150 + Math.floor(Math.random() * 25);
+    const existing = signKind3(otherFollowSk, [
+        ['p', 'not-real-hex'],
+        ['p', followTargetPk, 'http://bad-scheme.example', 'X\u{200B}smuggled'],
+        ['e', followTargetPk, '', 'wrong-kind-tag'],
+    ]);
+    const r = await followMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['list', otherFollowNpub]);
+    const out = JSON.parse(res.stdout);
+    assertEq(1, out.contacts.length, '121a: malformed pubkey + non-p tag dropped, valid entry retained');
+    const entry = out.contacts[0];
+    assertEq(followTargetPk, entry.pubkey, '121b: valid pubkey returned');
+    assertTrue(!('relay' in entry), '121c: bad-scheme relay silent-dropped to empty (omitted)');
+    assertTrue(!('petname' in entry), '121d: smuggled petname silent-dropped to empty (omitted)');
+    r.close();
+}
+
+// 122: list other-npub returns cleaned shape
+{
+    const port = 41175 + Math.floor(Math.random() * 25);
+    const existing = signKind3(otherFollowSk, [['p', followTargetPk, 'wss://x.example', 'Friend']]);
+    const r = await followMockRelay(port, existing);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['list', otherFollowNpub]);
+    const out = JSON.parse(res.stdout);
+    assertEq(otherFollowPk, out.pubkey, '122a: pubkey matches target');
+    assertEq(1, out.contacts.length, '122b: one entry');
+    r.close();
+}
+
+// 123: list contact-list-not-found
+{
+    const port = 41200 + Math.floor(Math.random() * 25);
+    const r = await followMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['list', otherFollowNpub]);
+    assertJsonField(res.stdout, 'error', 'contact-list-not-found', '123: no kind:3 -> contact-list-not-found');
+    r.close();
+}
+
+// 124: list rejects bad-sig kind:3
+{
+    const port = 41225 + Math.floor(Math.random() * 25);
+    const good = signKind3(otherFollowSk, [['p', followTargetPk, '', 'X']]);
+    const bad = { ...good, sig: '00'.repeat(64) };
+    const r = await followMockRelay(port, bad);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['list', otherFollowNpub]);
+    assertJsonField(res.stdout, 'error', 'contact-list-not-found', '124: bad-sig kind:3 rejected as not-found');
+    r.close();
+}
+
+// 125: list rejects author-mismatch
+{
+    const port = 41250 + Math.floor(Math.random() * 25);
+    // Mock returns a kind:3 signed by decoy but we ask for otherFollowNpub.
+    const decoyKind3 = signKind3(decoyFollowSk, [['p', followTargetPk, '', 'X']]);
+    const r = await followMockRelay(port, decoyKind3);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['list', otherFollowNpub]);
+    assertJsonField(res.stdout, 'error', 'contact-list-not-found', '125: author-mismatch kind:3 rejected');
+    r.close();
+}
+
+// 126: strict argv on list (codex r1 P2.2)
+{
+    const port = 41275 + Math.floor(Math.random() * 25);
+    const r = await followMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['list', otherFollowNpub, 'extra']);
+    assertJsonField(res.stdout, 'error', 'unexpected-extra-args', '126: trailing arg on list rejected');
+    r.close();
+}
+
+// 127: add publish-failed when no relay OKs
+{
+    const port = 41300 + Math.floor(Math.random() * 25);
+    const r = await followMockRelay(port, null, { okPublish: false });
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['add', followTargetNpub]);
+    assertJsonField(res.stdout, 'error', 'publish-failed', '127: add publish-failed');
+    r.close();
+}
+
+// 128: remove publish-failed when no relay OKs
+{
+    const port = 41325 + Math.floor(Math.random() * 25);
+    const existing = signKind3(ownSk, [['p', followTargetPk, '', 'X']]);
+    const r = await followMockRelay(port, existing, { okPublish: false });
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+    const res = await runFollow(['remove', followTargetNpub]);
+    assertJsonField(res.stdout, 'error', 'publish-failed', '128: remove publish-failed');
+    r.close();
+}
+
+// Need ownPk available to tests above. Hoist via function.
+function ownPk_DERIVED() { return getPublicKey(ownSk); }
 
 // ── Summary ──
 
