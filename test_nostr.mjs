@@ -1704,7 +1704,7 @@ function pointEnvToRelays(...urls) {
     r.close();
 }
 
-// ── 96-130: nostr.mjs follow (NIP-02 kind:3) ──
+// ── 96-128: nostr.mjs follow (NIP-02 kind:3) ──
 
 console.log('\nFollow:');
 
@@ -2186,6 +2186,288 @@ const decoyFollowPk = getPublicKey(decoyFollowSk);
 
 // Need ownPk available to tests above. Hoist via function.
 function ownPk_DERIVED() { return getPublicKey(ownSk); }
+
+// ── like (NIP-25 kind:7 reaction) ──────────────────────────────────────
+
+function likeMockRelay(port, eventToServe, opts = {}) {
+    return captureMockRelay(port, 7, eventToServe, opts);
+}
+
+function runLike(args, env = {}) {
+    return spawnCli('like', args, env, 'NOSTR_LIKE_TIMEOUT_MS', 2000);
+}
+
+const skLikeAuthor = generateSecretKey();
+const pkLikeAuthor = getPublicKey(skLikeAuthor);
+
+// 129: like <note1> happy path
+{
+    const port = 41400 + Math.floor(Math.random() * 25);
+    const target = signNote(skLikeAuthor, 'like-me note', []);
+    const r = await likeMockRelay(port, target);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    const note1 = nip19.noteEncode(target.id);
+    const res = await runLike([note1]);
+    assertEq(0, res.status, '129a: like via note1 exits 0');
+    const out = JSON.parse(res.stdout);
+    assertEq(true, out.ok, '129b: ok=true');
+    assertEq('+', out.content, '129c: content is +');
+    assertEq(1, r.published.length, '129d: exactly one kind:7 published');
+    const ev = r.published[0];
+    assertEq(7, ev.kind, '129e: kind is 7');
+    assertEq('+', ev.content, '129f: published content is +');
+    const eTag = ev.tags.find(t => t[0] === 'e');
+    const pTag = ev.tags.find(t => t[0] === 'p');
+    const kTag = ev.tags.find(t => t[0] === 'k');
+    assertEq(target.id, eTag?.[1], '129g: e-tag is target id');
+    assertEq(pkLikeAuthor, pTag?.[1], '129h: p-tag is resolved author pubkey');
+    assertEq('1', kTag?.[1], '129i: k-tag is "1"');
+    r.close();
+}
+
+// 130: like <nevent1> happy path
+{
+    const port = 41425 + Math.floor(Math.random() * 25);
+    const target = signNote(skLikeAuthor, 'like-me via nevent', []);
+    const r = await likeMockRelay(port, target);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    const nevent1 = nip19.neventEncode({ id: target.id });
+    const res = await runLike([nevent1]);
+    assertEq(0, res.status, '130a: like via nevent1 exits 0');
+    const ev = r.published[0];
+    assertEq(target.id, ev.tags.find(t => t[0] === 'e')?.[1], '130b: e-tag matches resolved id');
+    r.close();
+}
+
+// 131: like <raw-hex> accepted
+{
+    const port = 41450 + Math.floor(Math.random() * 25);
+    const target = signNote(skLikeAuthor, 'like-me via hex', []);
+    const r = await likeMockRelay(port, target);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    const res = await runLike([target.id]);
+    assertEq(0, res.status, '131: like via raw hex exits 0');
+    r.close();
+}
+
+// 132: target not found anywhere
+{
+    const port = 41475 + Math.floor(Math.random() * 25);
+    const r = await likeMockRelay(port, null);  // no event served
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    const fakeId = 'aa'.repeat(32);
+    const res = await runLike([fakeId]);
+    assertJsonField(res.stdout, 'error', 'event-not-found', '132: missing target -> event-not-found');
+    r.close();
+}
+
+// 133: target is kind:0 (not kind:1) -> resolver rejects -> event-not-found
+{
+    const port = 41500 + Math.floor(Math.random() * 25);
+    const kind0 = signKind0(skLikeAuthor, { name: 'not-a-note' });
+    const r = await likeMockRelay(port, kind0);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    const res = await runLike([kind0.id]);
+    assertJsonField(res.stdout, 'error', 'event-not-found', '133: kind:0 target rejected by resolver -> event-not-found');
+    assertEq(0, r.published.length, '133b: no kind:7 published');
+    r.close();
+}
+
+// 134: malformed bech32 (bad checksum on a note1 prefix)
+{
+    const port = 41525 + Math.floor(Math.random() * 25);
+    const r = await likeMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    // Real-looking but corrupt -- bad checksum
+    const badNote = 'note1' + 'q'.repeat(58);
+    const res = await runLike([badNote]);
+    assertJsonField(res.stdout, 'error', 'bad-target-event-id', '134: bad-checksum bech32 -> bad-target-event-id');
+    assertEq(0, r.recvReqs.length, '134b: no REQ frame sent to relay (rejected before network)');
+    r.close();
+}
+
+// 135: hex too short
+{
+    const port = 41550 + Math.floor(Math.random() * 25);
+    const r = await likeMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    const res = await runLike(['deadbeef']);
+    assertJsonField(res.stdout, 'error', 'bad-target-event-id', '135: short hex -> bad-target-event-id');
+    assertEq(0, r.recvReqs.length, '135b: no REQ frame sent');
+    r.close();
+}
+
+// 136: no positional
+{
+    const port = 41575 + Math.floor(Math.random() * 25);
+    const r = await likeMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    const res = await runLike([]);
+    assertJsonField(res.stdout, 'error', 'missing-target-event-id', '136: no positional -> missing-target-event-id');
+    assertEq(0, r.recvReqs.length, '136b: no REQ frame sent');
+    r.close();
+}
+
+// 137: trailing positional
+{
+    const port = 41600 + Math.floor(Math.random() * 25);
+    const r = await likeMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    const target = signNote(skLikeAuthor, 'x', []);
+    const res = await runLike([target.id, 'extra']);
+    assertJsonField(res.stdout, 'error', 'unexpected-extra-args', '137: trailing positional rejected');
+    assertEq(0, r.recvReqs.length, '137b: no REQ frame sent (rejected before network)');
+    r.close();
+}
+
+// 138: unknown flag
+{
+    const port = 41625 + Math.floor(Math.random() * 25);
+    const r = await likeMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    const target = signNote(skLikeAuthor, 'x', []);
+    const res = await runLike(['--emoji', target.id]);
+    assertJsonField(res.stdout, 'error', 'unknown-flag-emoji', '138: unknown flag rejected');
+    assertEq(0, r.recvReqs.length, '138b: no REQ frame sent');
+    r.close();
+}
+
+// 139: p-tag comes from RESOLVED event's pubkey, NOT from nevent1 author hint
+{
+    const port = 41650 + Math.floor(Math.random() * 25);
+    const target = signNote(skLikeAuthor, 'real note', []);
+    // Mock relay will serve the REAL kind:1 (with real pkLikeAuthor pubkey).
+    const r = await likeMockRelay(port, target);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    // Build an nevent1 that LIES about the author -- claims a fake pubkey.
+    const fakeAuthor = '11'.repeat(32);
+    const nevent1 = nip19.neventEncode({ id: target.id, author: fakeAuthor });
+    const res = await runLike([nevent1]);
+    assertEq(0, res.status, '139a: like with lying nevent1 still succeeds');
+    const ev = r.published[0];
+    const pTag = ev.tags.find(t => t[0] === 'p');
+    assertEq(pkLikeAuthor, pTag?.[1], '139b: p-tag uses RESOLVED pubkey, not nevent1 author hint');
+    assertTrue(pTag?.[1] !== fakeAuthor, '139c: p-tag is NOT the lying nevent1 hint');
+    r.close();
+}
+
+// 140: bad-sig kind:1 from relay -> resolver returns null -> event-not-found.
+// Use a DISTINCT valid signed event served under the requested id (id mismatch
+// would also trigger rejection, but tampering with sig directly is a cleaner
+// "verifyEvent rejects" signal). We forge a kind:1 with a known id but a sig
+// from a different secret key, so the sig doesn't validate against the
+// declared pubkey.
+{
+    const port = 41675 + Math.floor(Math.random() * 25);
+    const realTarget = signNote(skLikeAuthor, 'real', []);
+    // Tamper sig with random bytes -- verifyEvent will reject.
+    const tampered = { ...realTarget, sig: '00'.repeat(64) };
+    const r = await likeMockRelay(port, tampered);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    const res = await runLike([realTarget.id]);
+    assertJsonField(res.stdout, 'error', 'event-not-found', '140: bad-sig kind:1 from relay -> event-not-found');
+    assertEq(0, r.published.length, '140b: no kind:7 published');
+    r.close();
+}
+
+// 141: publish-failed when relay OK=false
+{
+    const port = 41700 + Math.floor(Math.random() * 25);
+    const target = signNote(skLikeAuthor, 'reject me', []);
+    const r = await likeMockRelay(port, target, { okPublish: false });
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    const res = await runLike([target.id]);
+    assertJsonField(res.stdout, 'error', 'publish-failed', '141: relay rejects -> publish-failed');
+    r.close();
+}
+
+// 142: self-like is ALLOWED (no cannot-like-self gate)
+{
+    const port = 41725 + Math.floor(Math.random() * 25);
+    const myNote = signNote(ownSk, 'my own note', []);  // signed with ownSk
+    const r = await likeMockRelay(port, myNote);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    const res = await runLike([myNote.id]);
+    assertEq(0, res.status, '142a: self-like exits 0 (allowed)');
+    const ev = r.published[0];
+    const pTag = ev.tags.find(t => t[0] === 'p');
+    const ownPub = getPublicKey(ownSk);
+    assertEq(ownPub, pTag?.[1], '142b: self-like p-tag is own pubkey');
+    assertEq(ownPub, ev.pubkey, '142c: self-like event signed by own key');
+    r.close();
+}
+
+// 143: uppercase hex input normalized to lowercase in published e-tag
+{
+    const port = 41750 + Math.floor(Math.random() * 25);
+    const target = signNote(skLikeAuthor, 'case test', []);
+    const r = await likeMockRelay(port, target);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    const res = await runLike([target.id.toUpperCase()]);
+    assertEq(0, res.status, '143a: uppercase hex input accepted');
+    const ev = r.published[0];
+    const eTag = ev.tags.find(t => t[0] === 'e');
+    assertEq(target.id, eTag?.[1], '143b: e-tag is lowercase (target.id is lowercase)');
+    assertTrue(eTag?.[1] === eTag?.[1].toLowerCase(), '143c: e-tag value is lowercase hex');
+    r.close();
+}
+
+// 144: decoder rejects npub1 / nsec1 / naddr1 at CLI level. We exercise
+// the helper through the supported command surface since nostr.mjs has
+// no module exports.
+{
+    const port = 41775 + Math.floor(Math.random() * 25);
+    const r = await likeMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    const npub = nip19.npubEncode(pkLikeAuthor);
+    const res144a = await runLike([npub]);
+    assertJsonField(res144a.stdout, 'error', 'bad-target-event-id', '144a: npub1 rejected as bad-target-event-id');
+
+    const nsec = nip19.nsecEncode(skLikeAuthor);
+    const res144b = await runLike([nsec]);
+    assertJsonField(res144b.stdout, 'error', 'bad-target-event-id', '144b: nsec1 rejected as bad-target-event-id');
+
+    const naddr = nip19.naddrEncode({ identifier: 'd', pubkey: pkLikeAuthor, kind: 30023 });
+    const res144c = await runLike([naddr]);
+    assertJsonField(res144c.stdout, 'error', 'bad-target-event-id', '144c: naddr1 rejected as bad-target-event-id');
+
+    assertEq(0, r.recvReqs.length, '144d: no REQ frame sent for any rejected input');
+    r.close();
+}
+
+// 145: malformed bech32 that passes the prefix pre-filter -> try/catch path
+{
+    const port = 41800 + Math.floor(Math.random() * 25);
+    const r = await likeMockRelay(port, null);
+    pointEnvToRelays(`ws://127.0.0.1:${port}`);
+
+    // "note1" prefix but garbage payload -> nip19.decode throws
+    const res145a = await runLike(['note1' + 'x'.repeat(58)]);
+    assertJsonField(res145a.stdout, 'error', 'bad-target-event-id', '145a: note1 bad-checksum rejected via try/catch');
+
+    // "nevent1" prefix with garbage payload
+    const res145b = await runLike(['nevent1' + 'q'.repeat(58)]);
+    assertJsonField(res145b.stdout, 'error', 'bad-target-event-id', '145b: nevent1 bad-checksum rejected via try/catch');
+
+    assertEq(0, r.recvReqs.length, '145c: no REQ frame sent for malformed bech32');
+    r.close();
+}
 
 // ── Summary ──
 

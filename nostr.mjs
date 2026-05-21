@@ -234,6 +234,41 @@ function normHexId(s) {
     return s.toLowerCase();
 }
 
+// Decode a Nostr event reference into a lowercase 64-hex id.
+// Accepts:
+//   - 64-char hex (uppercase tolerated, normalized to lowercase)
+//   - `note1...` (NIP-19 plain event-id encoding)
+//   - `nevent1...` (NIP-19 event with optional embedded relays/author/kind hints)
+// For `nevent1` we take ONLY the embedded `id`. The embedded `author` hint is
+// deliberately ignored -- the p-tag is derived from the resolved kind:1's
+// VERIFIED pubkey downstream, not from caller-supplied hints. Same for
+// `relays` (we use NOSTR_RELAYS) and `kind` (resolveEvent enforces kind:1).
+// Returns null for npub1 / nsec1 / naddr1 / malformed input.
+function decodeEventReference(raw) {
+    if (typeof raw !== 'string' || !raw) return null;
+
+    // Raw 64-hex first (cheap, no bech32 work).
+    const hex = normHexId(raw);
+    if (hex) return hex;
+
+    // Bech32: only `note1` and `nevent1`. Pre-filter by prefix so a stray
+    // nsec1/npub1/naddr1 doesn't even hit nip19.decode.
+    if (!raw.startsWith('note1') && !raw.startsWith('nevent1')) return null;
+
+    let decoded;
+    try { decoded = nip19.decode(raw); } catch { return null; }
+
+    if (decoded.type === 'note') {
+        // data is the hex id string.
+        return normHexId(decoded.data);
+    }
+    if (decoded.type === 'nevent') {
+        // data is {id, relays?, author?, kind?}. Take ONLY data.id.
+        return normHexId(decoded.data?.id);
+    }
+    return null;
+}
+
 // Build NIP-10 marker-style reply tags from a resolved parent event.
 // Pure function -- no I/O. Carried tag values are normalised through
 // normHexId so malformed entries are dropped and emitted hex is always
@@ -323,6 +358,7 @@ switch (cmd) {
     case 'send':   await doSend(); break;
     case 'search': await doSearch(); break;
     case 'reply':  await doReply(); break;
+    case 'like':   await doLike(); break;
     case 'profile': await doProfile(); break;
     case 'follow':  await doFollow(); break;
     case 'whoami': doWhoami(); break;
@@ -593,6 +629,65 @@ async function doReply() {
         id: ev.id,
         parent: parentId,
         tags,
+    }) + '\n');
+}
+
+// ── like: publish a NIP-25 kind:7 reaction (content "+") ──
+//
+// CLI surface: nostr.mjs like <note-id-or-bech32>
+// Accepts raw 64-hex, `note1...`, or `nevent1...`. Resolves the target
+// via resolveEvent (which enforces sig + id match + kind:1) so the
+// p-tag uses the target's VERIFIED pubkey, not anything the caller
+// supplied (would otherwise be a public-endorsement forgery vector).
+// Single fixed content `"+"`; emoji reactions deferred until needed.
+//
+// Self-likes are allowed without comment (no security issue; refusing
+// is opinion). The SKILL warns the agent about adversarial feed items.
+
+async function doLike() {
+    const targetArg = args.shift();
+    if (targetArg === undefined) err('missing-target-event-id');
+    if (targetArg.startsWith('--')) err(`unknown-flag-${targetArg.replace(/^--/, '')}`);
+    const targetHex = decodeEventReference(targetArg);
+    if (!targetHex) err('bad-target-event-id');
+    if (args.length) err('unexpected-extra-args');
+
+    const env = loadEnv();
+    if (!env.nsec) err('not-logged-in');
+    let sk;
+    try { sk = decodeNsec(env.nsec); } catch { err('nsec-decode-failed'); }
+
+    const timeoutMs = parseInt(process.env.NOSTR_LIKE_TIMEOUT_MS || '5000', 10);
+
+    // resolveEvent enforces verifyEvent + id match + kind:1. Non-kind:1
+    // targets surface here as null -> event-not-found (no separate code).
+    const resolved = await resolveEvent(targetHex, env.relays, timeoutMs);
+    if (!resolved) err('event-not-found');
+    const { event: target } = resolved;
+
+    // p-tag pubkey MUST come from the resolved event's verified pubkey,
+    // NOT from the caller's input (nevent1 embeds an optional author hint
+    // we deliberately ignore). normHexId on the resolved pubkey is the
+    // canonical "tag content is always lowercase hex" step.
+    const ev = finalizeEvent({
+        kind: 7,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [
+            ['e', targetHex],
+            ['p', normHexId(target.pubkey)],
+            ['k', '1'],
+        ],
+        content: '+',
+    }, sk);
+
+    const ok = await publishOneShot(ev, env.relays, timeoutMs);
+    if (!ok) err('publish-failed');
+
+    process.stdout.write(JSON.stringify({
+        ok: true,
+        id: ev.id,
+        target: nip19.noteEncode(targetHex),
+        content: '+',
     }) + '\n');
 }
 
@@ -1236,6 +1331,7 @@ function doHelp() {
             'send <npub> <body>',
             'search [--tag <topic>] [--kind n] [--limit n] [--since 7d] [--author <npub>] [<keyword>]',
             'reply <parent-event-id> <body>',
+            'like <note-id-or-bech32>',
             'profile set [--name s] [--about s] [--picture url] [--banner url] [--nip05 s] [--lud16 s] [--website url] [--replace]',
             'profile get [<npub>]',
             'follow add <npub> [--petname s] [--relay wss-url]',
