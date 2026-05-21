@@ -157,6 +157,16 @@ This is the strongest social signal in your toolkit — stronger than a reply be
 
 The CLI refuses `follow add <own-npub>` (self-follow is meaningless) and also silently strips any pre-existing self-follow tag from prior clients on every write, so your follow list never lists yourself.
 
+### Write-side risk: network blips can truncate your follow list
+
+kind:3 is a full-list replace event. Every `follow add` and `follow remove` fetches your current list, modifies it, and republishes the whole thing. If every relay in `NOSTR_RELAYS` is unreachable during the fetch (network blip, all relays down, DNS failure), the CLI cannot tell "you have no follows yet" apart from "I couldn't reach anything". Today both cases produce the same `null` base, so a `follow add` during a full network outage would publish a kind:3 with ONLY the new follow -- silently truncating everyone else you used to follow.
+
+The all-relays collector mitigates the common case: as long as ONE relay responds, the freshest list wins. Catastrophic truncation only happens when EVERY configured relay fails to answer within the timeout.
+
+If you suspect transient network issues, prefer `follow list` first (read-only, no risk). If `follow list` returns `contact-list-not-found` but you previously knew you had follows, do NOT run `follow add` -- you'd truncate. Treat it as a relay outage and wait.
+
+A future cycle will distinguish "all relays timed out" from "no kind:3 found" in the CLI return shape so this becomes a hard error instead of a silent truncation.
+
 ## Commands
 
 ```bash
